@@ -153,13 +153,35 @@ object PosterImageCache {
     private const val TAG = "PosterImageCache"
     private var okHttpClient: OkHttpClient? = null
 
-    // 30MB RAM cache for instant 0ms repeated card displays
-    private val memoryCache = object : LruCache<String, ByteArray>(30 * 1024 * 1024) {
+    // 16MB RAM cache for instant 0ms repeated card displays with bounded memory footprint
+    private const val MAX_RAM_ENTRY_BYTES = 4 * 1024 * 1024
+    private val memoryCache = object : LruCache<String, ByteArray>(16 * 1024 * 1024) {
         override fun sizeOf(key: String, value: ByteArray): Int = value.size
     }
 
     // Locks to deduplicate concurrent requests for the identical poster URL
     private val inFlightLocks = ConcurrentHashMap<String, Any>()
+
+    fun memoryCacheSizeBytes(): Int = memoryCache.size()
+
+    fun clearMemoryCache() {
+        memoryCache.evictAll()
+    }
+
+    fun trimMemory(level: Int) {
+        when {
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> {
+                memoryCache.evictAll()
+            }
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE ||
+                level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                memoryCache.trimToSize(memoryCache.maxSize() / 2)
+            }
+            level == android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> {
+                memoryCache.trimToSize(memoryCache.maxSize() / 2)
+            }
+        }
+    }
 
     fun init(context: Context) {
         if (okHttpClient != null) return
@@ -258,17 +280,20 @@ object PosterImageCache {
                     .header("User-Agent", "Mozilla/5.0 (Linux; Android; MYCINEMA/1.0)")
                     .build()
 
-                val response = client.newCall(req).execute()
-                if (response.isSuccessful) {
-                    val bytes = response.body?.bytes()
-                    if (bytes != null && bytes.isNotEmpty()) {
-                        memoryCache.put(urlStr, bytes)
-                        val mimeType = guessMimeType(urlStr, response.header("Content-Type"))
-                        val headers = mapOf(
-                            "Access-Control-Allow-Origin" to "*",
-                            "Cache-Control" to "public, max-age=2592000, immutable"
-                        )
-                        return WebResourceResponse(mimeType, "UTF-8", 200, "OK", headers, ByteArrayInputStream(bytes))
+                client.newCall(req).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val bytes = response.body?.bytes()
+                        if (bytes != null && bytes.isNotEmpty()) {
+                            if (bytes.size <= MAX_RAM_ENTRY_BYTES) {
+                                memoryCache.put(urlStr, bytes)
+                            }
+                            val mimeType = guessMimeType(urlStr, response.header("Content-Type"))
+                            val headers = mapOf(
+                                "Access-Control-Allow-Origin" to "*",
+                                "Cache-Control" to "public, max-age=2592000, immutable"
+                            )
+                            return WebResourceResponse(mimeType, "UTF-8", 200, "OK", headers, ByteArrayInputStream(bytes))
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -341,6 +366,7 @@ class MainActivity : ComponentActivity() {
         private const val FCM_TAG = "FCM_Notification"
         const val DEFAULT_REWARDED_AD_UNIT_ID = "ca-app-pub-2277779478101583/1404104591"
         const val EPISODE_REWARDED_AD_UNIT_ID = "ca-app-pub-2277779478101583/9116970862"
+        const val DOWNLOAD_REWARDED_AD_UNIT_ID = "ca-app-pub-2277779478101583/9003880054"
         const val PREFS_ADMOB = "admob_system_prefs"
         const val KEY_EXEMPT_UNTIL = "admob_exempt_until"
         const val KEY_FIVE_ADS_COUNT = "admob_five_ads_count"
@@ -420,6 +446,7 @@ class MainActivity : ComponentActivity() {
     val activeDownloads = ConcurrentHashMap<Long, DownloadItemInfo>()
     val episodeKeyToDownloadId = ConcurrentHashMap<String, Long>()
     internal val activePosterDownloads = ConcurrentHashMap<String, Boolean>()
+    private var downloadedEpisodeFilesCache: ConcurrentHashMap<String, String>? = null
     private var isProgressPollingActive: Boolean = false
     private var downloadCompleteReceiver: BroadcastReceiver? = null
 
@@ -781,7 +808,8 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.BLACK)
             isFocusable = true
             isFocusableInTouchMode = true
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+            // Let Chromium manage hardware compositor tiles natively without an extra redundant offscreen FBO layer
+            setLayerType(View.LAYER_TYPE_NONE, null)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
             }
@@ -799,7 +827,7 @@ class MainActivity : ComponentActivity() {
                 loadsImagesAutomatically = true
                 blockNetworkImage = false
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    offscreenPreRaster = true
+                    offscreenPreRaster = false
                 }
                 setSupportMultipleWindows(true)
                 try {
@@ -1580,6 +1608,7 @@ class MainActivity : ComponentActivity() {
         runOnUiThread {
             stopPlaybackTicker()
             exoPlayer?.stop()
+            exoPlayer?.clearMediaItems()
             isVideoRotated180 = false
             applyVideoDisplayRotation(animate = false)
             playerView.hideController()
@@ -2809,36 +2838,64 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun ensureDownloadedCacheLoaded(): ConcurrentHashMap<String, String> {
+        downloadedEpisodeFilesCache?.let { return it }
+        val prefs = getSharedPreferences("black_anime_downloads", Context.MODE_PRIVATE)
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val map = ConcurrentHashMap<String, String>()
+        var editor: android.content.SharedPreferences.Editor? = null
+        for ((k, v) in prefs.all) {
+            if (k.startsWith("file_") && v is String) {
+                val key = k.removePrefix("file_")
+                val file = File(downloadsDir, v)
+                if (file.exists()) {
+                    map[key] = v
+                } else {
+                    if (editor == null) editor = prefs.edit()
+                    editor.remove(k)
+                }
+            }
+        }
+        editor?.apply()
+        downloadedEpisodeFilesCache = map
+        return map
+    }
+
     fun markEpisodeDownloadedInPrefs(episodeKey: String, fileName: String) {
         val prefs = getSharedPreferences("black_anime_downloads", Context.MODE_PRIVATE)
         prefs.edit().putString("file_$episodeKey", fileName).apply()
+        ensureDownloadedCacheLoaded()[episodeKey] = fileName
     }
 
     fun isEpisodeDownloaded(episodeKey: String): Boolean {
-        val prefs = getSharedPreferences("black_anime_downloads", Context.MODE_PRIVATE)
-        val fileName = prefs.getString("file_$episodeKey", null) ?: return false
-        val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
+        val cache = ensureDownloadedCacheLoaded()
+        val cachedFile = cache[episodeKey] ?: return false
+        val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), cachedFile)
         val exists = file.exists()
         if (!exists) {
+            cache.remove(episodeKey)
+            val prefs = getSharedPreferences("black_anime_downloads", Context.MODE_PRIVATE)
             prefs.edit().remove("file_$episodeKey").apply()
         }
         return exists
     }
 
     fun getDownloadedEpisodesJson(): String {
-        val prefs = getSharedPreferences("black_anime_downloads", Context.MODE_PRIVATE)
-        val all = prefs.all
+        val cache = ensureDownloadedCacheLoaded()
         val json = JSONObject()
-        for ((k, v) in all) {
-            if (k.startsWith("file_") && v is String) {
-                val key = k.removePrefix("file_")
-                val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), v)
-                if (file.exists()) {
-                    json.put(key, v)
-                }
-            }
+        for ((k, v) in cache) {
+            json.put(k, v)
         }
         return json.toString()
+    }
+
+    fun getDownloadedEpisodeKeysJsonArray(): String {
+        val cache = ensureDownloadedCacheLoaded()
+        val arr = org.json.JSONArray()
+        for (k in cache.keys) {
+            arr.put(k)
+        }
+        return arr.toString()
     }
 
     fun openDownloadedVideo(episodeKey: String): Boolean {
@@ -2846,6 +2903,7 @@ class MainActivity : ComponentActivity() {
         val fileName = prefs.getString("file_$episodeKey", null) ?: return false
         val file = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), fileName)
         if (!file.exists()) {
+            downloadedEpisodeFilesCache?.remove(episodeKey)
             prefs.edit().remove("file_$episodeKey").apply()
             return false
         }
@@ -2872,9 +2930,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        PosterImageCache.trimMemory(level)
+        if (level >= TRIM_MEMORY_MODERATE && ::webView.isInitialized && isWebViewLoaded) {
+            try {
+                webView.clearCache(false)
+            } catch (_: Exception) {}
+        }
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        PosterImageCache.clearMemoryCache()
+        if (::webView.isInitialized && isWebViewLoaded) {
+            try {
+                webView.clearCache(false)
+            } catch (_: Exception) {}
+        }
+    }
+
     override fun onDestroy() {
         stopPlaybackTicker()
         isProgressPollingActive = false
+        mainHandler.removeCallbacksAndMessages(null)
+        adMobBridge?.releaseOnDestroy()
         try {
             downloadCompleteReceiver?.let { unregisterReceiver(it) }
             downloadCompleteReceiver = null
@@ -2883,7 +2963,9 @@ class MainActivity : ComponentActivity() {
         }
         exoPlayer?.release()
         exoPlayer = null
-        webView.destroy()
+        if (::webView.isInitialized) {
+            webView.destroy()
+        }
         super.onDestroy()
     }
 
@@ -2927,6 +3009,35 @@ class MainActivity : ComponentActivity() {
         @Volatile private var episodeLoadRetryCount: Int = 0
         private val MAX_EPISODE_LOAD_RETRIES = 3
 
+        // ================= Download Rewarded Ad System State (Separate Unit ID) =================
+        @Volatile internal var downloadAdState: String = "IDLE"
+        @Volatile internal var currentDownloadAttemptId: String = ""
+        @Volatile private var isLoadingDownloadAd: Boolean = false
+        @Volatile private var isShowingDownloadAd: Boolean = false
+        @Volatile private var currentDownloadFid: String = ""
+        @Volatile private var currentDownloadIdx: Int = 0
+        @Volatile private var currentDownloadEpisodeKey: String = ""
+
+        @Volatile private var preloadedDownloadAd: RewardedAd? = null
+        @Volatile private var preloadedDownloadAdTimestamp: Long = 0L
+        @Volatile private var isDownloadAdUnitLoading: Boolean = false
+        @Volatile private var downloadAdLoadStartTime: Long = 0L
+
+        @Volatile internal var activeDownloadSearchAttemptId: String = ""
+        @Volatile private var activeDownloadFid: String = ""
+        @Volatile private var activeDownloadIdx: Int = 0
+        @Volatile private var activeDownloadEpisodeKey: String = ""
+        @Volatile private var activeDownloadSearchStartTime: Long = 0L
+        private var downloadRetry15sRunnable: Runnable? = null
+        private var downloadTimeout30sRunnable: Runnable? = null
+        private var downloadLoadRetryRunnable: Runnable? = null
+        @Volatile private var downloadLoadRetryCount: Int = 0
+
+        // Strict native reward verification registry populated ONLY inside OnUserEarnedRewardListener
+        private val verifiedDownloadRewardTokens = ConcurrentHashMap<String, String>()
+        private val verifiedDownloadRewardKeys = ConcurrentHashMap<String, Long>()
+        private val DOWNLOAD_REWARD_TOKEN_TTL_MS = 2 * 60 * 1000L
+
         private fun isAdValid(ad: RewardedAd?, timestamp: Long): Boolean {
             if (ad == null || timestamp <= 0L) return false
             val age = System.currentTimeMillis() - timestamp
@@ -2942,17 +3053,74 @@ class MainActivity : ComponentActivity() {
             episodeLoadRetryRunnable = null
         }
 
+        private fun cancelDownloadSearchRunnables() {
+            downloadRetry15sRunnable?.let { mainHandler.removeCallbacks(it) }
+            downloadRetry15sRunnable = null
+            downloadTimeout30sRunnable?.let { mainHandler.removeCallbacks(it) }
+            downloadTimeout30sRunnable = null
+            downloadLoadRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+            downloadLoadRetryRunnable = null
+        }
+
+        internal fun grantVerifiedDownloadReward(attemptId: String, episodeKey: String) {
+            if (attemptId.isNotBlank()) {
+                verifiedDownloadRewardTokens[attemptId] = episodeKey
+            }
+            if (episodeKey.isNotBlank()) {
+                verifiedDownloadRewardKeys[episodeKey] = System.currentTimeMillis()
+            }
+        }
+
+        internal fun revokeVerifiedDownloadReward(attemptId: String, episodeKey: String) {
+            if (attemptId.isNotBlank()) {
+                verifiedDownloadRewardTokens.remove(attemptId)
+            }
+            if (episodeKey.isNotBlank()) {
+                verifiedDownloadRewardKeys.remove(episodeKey)
+            }
+        }
+
+        internal fun consumeVerifiedDownloadReward(attemptId: String?, episodeKey: String): Boolean {
+            val now = System.currentTimeMillis()
+            verifiedDownloadRewardKeys.entries.removeIf { (_, ts) -> (now - ts) > DOWNLOAD_REWARD_TOKEN_TTL_MS }
+            val cleanAttempt = attemptId?.trim().orEmpty()
+            if (cleanAttempt.isNotEmpty()) {
+                val matchedKey = verifiedDownloadRewardTokens[cleanAttempt]
+                if (matchedKey != null && (matchedKey.isEmpty() || matchedKey == episodeKey)) {
+                    verifiedDownloadRewardTokens.remove(cleanAttempt)
+                    verifiedDownloadRewardKeys.remove(episodeKey)
+                    return true
+                }
+            }
+            val keyTs = verifiedDownloadRewardKeys[episodeKey]
+            if (keyTs != null && (now - keyTs) <= DOWNLOAD_REWARD_TOKEN_TTL_MS) {
+                verifiedDownloadRewardKeys.remove(episodeKey)
+                return true
+            }
+            return false
+        }
+
+        fun releaseOnDestroy() {
+            mainHandler.removeCallbacksAndMessages(null)
+            preloadedEpisodeAd = null
+            preloadedDownloadAd = null
+            verifiedDownloadRewardTokens.clear()
+            verifiedDownloadRewardKeys.clear()
+        }
+
         fun onMobileAdsInitialized() {
             activity.runOnUiThread {
                 isMobileAdsInitialized = true
-                Log.d(TAG, "AdMob: MobileAds initialized. Starting early episode ad preloading...")
+                Log.d(TAG, "AdMob: MobileAds initialized. Starting early episode & download ad preloading...")
                 preloadEpisodeAd("startup_initialization")
+                preloadDownloadAd("startup_initialization")
             }
         }
 
         // Helpers
         private fun isAnyAdShowing(): Boolean =
-            isShowingFiveAds || isShowingEpisode || fiveAdsState == "SHOWING" || episodeState == "SHOWING"
+            isShowingFiveAds || isShowingEpisode || isShowingDownloadAd ||
+                fiveAdsState == "SHOWING" || episodeState == "SHOWING" || downloadAdState == "SHOWING"
 
         @JavascriptInterface
         fun isAdShowing(): Boolean = isAnyAdShowing()
@@ -2961,9 +3129,12 @@ class MainActivity : ComponentActivity() {
         fun getAdState(): String {
             return when {
                 isAnyAdShowing() -> "SHOWING"
-                isLoadingFiveAds || isLoadingEpisode || fiveAdsState == "LOADING" || episodeState == "LOADING" || activeEpisodeSearchAttemptId.isNotEmpty() -> "LOADING"
-                preloadedEpisodeAd != null && isAdValid(preloadedEpisodeAd, preloadedEpisodeAdTimestamp) -> "READY"
-                fiveAdsState == "FAILED" || episodeState == "FAILED" -> "FAILED"
+                isLoadingFiveAds || isLoadingEpisode || isLoadingDownloadAd ||
+                    fiveAdsState == "LOADING" || episodeState == "LOADING" || downloadAdState == "LOADING" ||
+                    activeEpisodeSearchAttemptId.isNotEmpty() || activeDownloadSearchAttemptId.isNotEmpty() -> "LOADING"
+                (preloadedEpisodeAd != null && isAdValid(preloadedEpisodeAd, preloadedEpisodeAdTimestamp)) ||
+                    (preloadedDownloadAd != null && isAdValid(preloadedDownloadAd, preloadedDownloadAdTimestamp)) -> "READY"
+                fiveAdsState == "FAILED" || episodeState == "FAILED" || downloadAdState == "FAILED" -> "FAILED"
                 else -> "IDLE"
             }
         }
@@ -2978,6 +3149,17 @@ class MainActivity : ComponentActivity() {
                 isLoadingEpisode || episodeState == "LOADING" || activeEpisodeSearchAttemptId.isNotEmpty() -> "LOADING"
                 preloadedEpisodeAd != null && isAdValid(preloadedEpisodeAd, preloadedEpisodeAdTimestamp) -> "READY"
                 episodeState == "FAILED" -> "FAILED"
+                else -> "IDLE"
+            }
+        }
+
+        @JavascriptInterface
+        fun getDownloadAdState(): String {
+            return when {
+                isShowingDownloadAd || downloadAdState == "SHOWING" -> "SHOWING"
+                isLoadingDownloadAd || downloadAdState == "LOADING" || activeDownloadSearchAttemptId.isNotEmpty() -> "LOADING"
+                preloadedDownloadAd != null && isAdValid(preloadedDownloadAd, preloadedDownloadAdTimestamp) -> "READY"
+                downloadAdState == "FAILED" -> "FAILED"
                 else -> "IDLE"
             }
         }
@@ -3042,6 +3224,9 @@ class MainActivity : ComponentActivity() {
                 if (currentEpisodeAttemptId == attemptId) {
                     cancelEpisodeAdAttempt(attemptId)
                 }
+                if (currentDownloadAttemptId == attemptId || activeDownloadSearchAttemptId == attemptId) {
+                    cancelDownloadAdAttempt(attemptId)
+                }
             }
         }
 
@@ -3081,22 +3266,52 @@ class MainActivity : ComponentActivity() {
         }
 
         @JavascriptInterface
+        fun cancelDownloadAdAttempt(attemptId: String) {
+            activity.runOnUiThread {
+                if (attemptId.isBlank() || currentDownloadAttemptId == attemptId || activeDownloadSearchAttemptId == attemptId) {
+                    val keyToClear = currentDownloadEpisodeKey.ifBlank { activeDownloadEpisodeKey }
+                    val idToClear = currentDownloadAttemptId.ifBlank { activeDownloadSearchAttemptId }
+                    Log.d(TAG, "AdMob [Download]: cancelDownloadAdAttempt() for attempt $idToClear")
+                    cancelDownloadSearchRunnables()
+                    revokeVerifiedDownloadReward(idToClear, keyToClear)
+                    activeDownloadSearchAttemptId = ""
+                    currentDownloadAttemptId = ""
+                    activeDownloadFid = ""
+                    activeDownloadIdx = 0
+                    activeDownloadEpisodeKey = ""
+                    currentDownloadFid = ""
+                    currentDownloadIdx = 0
+                    currentDownloadEpisodeKey = ""
+                    downloadLoadRetryCount = 0
+                    isLoadingDownloadAd = false
+                    if (downloadAdState == "LOADING") {
+                        downloadAdState = "IDLE"
+                    }
+                }
+            }
+        }
+
+        @JavascriptInterface
         fun resetAdState() {
             activity.runOnUiThread {
                 if (!isAnyAdShowing()) {
                     fiveAdsTimeoutRunnable?.let { mainHandler.removeCallbacks(it) }
                     fiveAdsTimeoutRunnable = null
                     cancelEpisodeSearchRunnables()
+                    cancelDownloadSearchRunnables()
                     fiveAdsState = "IDLE"
                     episodeState = "IDLE"
+                    downloadAdState = "IDLE"
                     isLoadingFiveAds = false
                     isLoadingEpisode = false
+                    isLoadingDownloadAd = false
                     currentFiveAdsAttemptId = ""
                     currentEpisodeAttemptId = ""
                     activeEpisodeSearchAttemptId = ""
+                    currentDownloadAttemptId = ""
+                    activeDownloadSearchAttemptId = ""
                     episodeLoadRetryCount = 0
-                    episodeLoadRetryRunnable?.let { mainHandler.removeCallbacks(it) }
-                    episodeLoadRetryRunnable = null
+                    downloadLoadRetryCount = 0
                     Log.d(TAG, "AdMob: All ad states reset to IDLE.")
                 }
             }
@@ -3146,6 +3361,21 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun downloadEpisode(url: String, animeTitle: String, episodeTitle: String, episodeKey: String): String {
+            return downloadEpisodeWithReward(url, animeTitle, episodeTitle, episodeKey, "")
+        }
+
+        @JavascriptInterface
+        fun downloadEpisodeWithReward(
+            url: String,
+            animeTitle: String,
+            episodeTitle: String,
+            episodeKey: String,
+            attemptId: String
+        ): String {
+            if (!consumeVerifiedDownloadReward(attemptId, episodeKey)) {
+                Log.w(TAG, "AdMob [Download]: Blocked downloadEpisodeWithReward for key=$episodeKey — no verified OnUserEarnedRewardListener reward.")
+                return "AD_REWARD_REQUIRED"
+            }
             activity.runOnUiThread {
                 activity.checkStoragePermissionAndDownload(
                     DownloadRequest(url, animeTitle, episodeTitle, episodeKey)
@@ -3176,6 +3406,11 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun getDownloadedEpisodesList(): String {
             return activity.getDownloadedEpisodesJson()
+        }
+
+        @JavascriptInterface
+        fun getDownloadedEpisodeKeysJson(): String {
+            return activity.getDownloadedEpisodeKeysJsonArray()
         }
 
         @JavascriptInterface
@@ -4106,6 +4341,318 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // ================= Download Rewarded Ad System Implementation (Strict Reward Gate) =================
+
+        private fun scheduleDownloadLoadRetry(trigger: String) {
+            if (activeDownloadSearchAttemptId.isEmpty() || isShowingDownloadAd || downloadAdState != "LOADING") return
+            if (downloadLoadRetryCount >= MAX_EPISODE_LOAD_RETRIES) {
+                Log.w(TAG, "AdMob [Download]: Retry limit reached for active attempt $activeDownloadSearchAttemptId. Waiting for timeout.")
+                return
+            }
+
+            downloadLoadRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+            val retryNumber = downloadLoadRetryCount + 1
+            val delayMs = when (retryNumber) {
+                1 -> 1000L
+                2 -> 4000L
+                else -> 8000L
+            }
+            val attemptId = activeDownloadSearchAttemptId
+            downloadLoadRetryRunnable = Runnable {
+                activity.runOnUiThread {
+                    downloadLoadRetryRunnable = null
+                    if (activeDownloadSearchAttemptId != attemptId || isShowingDownloadAd || downloadAdState != "LOADING") return@runOnUiThread
+                    downloadLoadRetryCount = retryNumber
+                    Log.d(TAG, "AdMob [Download]: Retry #$retryNumber after ${delayMs}ms (trigger=$trigger, attempt=$attemptId)")
+                    preloadDownloadAd("retry_${retryNumber}_$trigger")
+                }
+            }
+            mainHandler.postDelayed(downloadLoadRetryRunnable!!, delayMs)
+        }
+
+        fun preloadDownloadAd(trigger: String) {
+            activity.runOnUiThread {
+                if (!isMobileAdsInitialized) {
+                    Log.d(TAG, "AdMob [Download Preload]: Skipped (trigger=$trigger) - MobileAds SDK not initialized yet.")
+                    return@runOnUiThread
+                }
+                if (isDownloadAdUnitLoading) {
+                    Log.d(TAG, "AdMob [Download Preload]: Skipped (trigger=$trigger) - Load request already in-flight.")
+                    return@runOnUiThread
+                }
+                if (preloadedDownloadAd != null && isAdValid(preloadedDownloadAd, preloadedDownloadAdTimestamp)) {
+                    Log.d(TAG, "AdMob [Download Preload]: Skipped (trigger=$trigger) - Valid preloaded download ad already cached.")
+                    return@runOnUiThread
+                }
+                if (isAnyAdShowing()) {
+                    Log.d(TAG, "AdMob [Download Preload]: Postponed (trigger=$trigger) - Another ad is currently SHOWING.")
+                    return@runOnUiThread
+                }
+
+                isDownloadAdUnitLoading = true
+                downloadLoadRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+                downloadLoadRetryRunnable = null
+                downloadAdLoadStartTime = System.currentTimeMillis()
+                val targetUnitId = DOWNLOAD_REWARDED_AD_UNIT_ID
+                Log.d(TAG, "AdMob [Download Preload]: [Request Start] Unit: $targetUnitId (trigger=$trigger)")
+
+                val adRequest = AdRequest.Builder().build()
+                RewardedAd.load(activity, targetUnitId, adRequest, object : RewardedAdLoadCallback() {
+                    override fun onAdLoaded(rewardedAd: RewardedAd) {
+                        activity.runOnUiThread {
+                            val duration = System.currentTimeMillis() - downloadAdLoadStartTime
+                            isDownloadAdUnitLoading = false
+                            downloadLoadRetryCount = 0
+                            downloadLoadRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+                            downloadLoadRetryRunnable = null
+                            preloadedDownloadAd = rewardedAd
+                            preloadedDownloadAdTimestamp = System.currentTimeMillis()
+                            Log.d(TAG, "AdMob [Download Preload]: [Request Success] Loaded in ${duration}ms (trigger=$trigger)")
+
+                            val waitingAttemptId = activeDownloadSearchAttemptId
+                            if (waitingAttemptId.isNotEmpty() && !isShowingDownloadAd && downloadAdState == "LOADING") {
+                                cancelDownloadSearchRunnables()
+                                val adToShow = preloadedDownloadAd
+                                preloadedDownloadAd = null
+                                preloadedDownloadAdTimestamp = 0L
+                                if (adToShow != null) {
+                                    showLoadedDownloadAd(adToShow, waitingAttemptId, activeDownloadFid, activeDownloadIdx, activeDownloadEpisodeKey)
+                                }
+                            }
+                        }
+                    }
+
+                    override fun onAdFailedToLoad(loadAdError: LoadAdError) {
+                        activity.runOnUiThread {
+                            val duration = System.currentTimeMillis() - downloadAdLoadStartTime
+                            isDownloadAdUnitLoading = false
+                            preloadedDownloadAd = null
+                            preloadedDownloadAdTimestamp = 0L
+
+                            Log.w(
+                                TAG,
+                                "AdMob [Download Preload]: [Request Failed] in ${duration}ms (trigger=$trigger) - Code: ${loadAdError.code}, Message: ${loadAdError.message}"
+                            )
+
+                            if (activeDownloadSearchAttemptId.isNotEmpty() && downloadAdState == "LOADING" && !isShowingDownloadAd) {
+                                if (downloadLoadRetryCount >= MAX_EPISODE_LOAD_RETRIES) {
+                                    val failedAttemptId = activeDownloadSearchAttemptId
+                                    val failedKey = activeDownloadEpisodeKey
+                                    cancelDownloadSearchRunnables()
+                                    activeDownloadSearchAttemptId = ""
+                                    currentDownloadAttemptId = ""
+                                    downloadAdState = "FAILED"
+                                    isLoadingDownloadAd = false
+                                    revokeVerifiedDownloadReward(failedAttemptId, failedKey)
+                                    val failReason = if (loadAdError.code == AdRequest.ERROR_CODE_NO_FILL) "no_fill" else "load_failed"
+                                    notifyDownloadAdResult(false, failReason, failedAttemptId, failedKey)
+                                } else {
+                                    scheduleDownloadLoadRetry(trigger)
+                                }
+                            }
+                        }
+                    }
+                })
+            }
+        }
+
+        @JavascriptInterface
+        fun loadAndShowDownloadAd(
+            timeoutMs: Long,
+            attemptId: String,
+            episodeFid: String,
+            episodeIdx: Int,
+            episodeKey: String
+        ) {
+            val targetUnitId = DOWNLOAD_REWARDED_AD_UNIT_ID
+            activity.runOnUiThread {
+                // Reject if another ad is currently SHOWING or loading an overlapping attempt
+                if (isAnyAdShowing()) {
+                    Log.w(TAG, "AdMob [Download]: loadAndShowDownloadAd rejected - another ad is currently SHOWING.")
+                    notifyDownloadAdResult(false, "ad_already_showing", attemptId, episodeKey)
+                    return@runOnUiThread
+                }
+
+                cancelDownloadSearchRunnables()
+                revokeVerifiedDownloadReward(currentDownloadAttemptId, currentDownloadEpisodeKey)
+
+                activeDownloadSearchAttemptId = attemptId
+                activeDownloadFid = episodeFid
+                activeDownloadIdx = episodeIdx
+                activeDownloadEpisodeKey = episodeKey
+                activeDownloadSearchStartTime = System.currentTimeMillis()
+                downloadLoadRetryCount = 0
+
+                currentDownloadAttemptId = attemptId
+                currentDownloadFid = episodeFid
+                currentDownloadIdx = episodeIdx
+                currentDownloadEpisodeKey = episodeKey
+                downloadAdState = "LOADING"
+                isLoadingDownloadAd = true
+
+                Log.d(
+                    TAG,
+                    "AdMob [Download]: [Search Start] Attempt $attemptId for key=$episodeKey with Unit $targetUnitId"
+                )
+
+                // Stage 1: Use valid preloaded download ad immediately if ready
+                val cachedAd = preloadedDownloadAd
+                if (cachedAd != null && isAdValid(cachedAd, preloadedDownloadAdTimestamp)) {
+                    preloadedDownloadAd = null
+                    preloadedDownloadAdTimestamp = 0L
+                    showLoadedDownloadAd(cachedAd, attemptId, episodeFid, episodeIdx, episodeKey)
+                    return@runOnUiThread
+                }
+
+                if (!isDownloadAdUnitLoading) {
+                    preloadDownloadAd("download_immediate_search")
+                }
+
+                // Stage 2: Milestone at 15s
+                val retry15s = Runnable {
+                    activity.runOnUiThread {
+                        if (activeDownloadSearchAttemptId != attemptId || isShowingDownloadAd || downloadAdState == "SHOWING") {
+                            return@runOnUiThread
+                        }
+                        val candidate = preloadedDownloadAd
+                        if (candidate != null && isAdValid(candidate, preloadedDownloadAdTimestamp)) {
+                            cancelDownloadSearchRunnables()
+                            preloadedDownloadAd = null
+                            preloadedDownloadAdTimestamp = 0L
+                            showLoadedDownloadAd(candidate, attemptId, episodeFid, episodeIdx, episodeKey)
+                            return@runOnUiThread
+                        }
+                        if (!isDownloadAdUnitLoading) {
+                            preloadDownloadAd("download_stage2_15s_retry")
+                        }
+                    }
+                }
+                downloadRetry15sRunnable = retry15s
+                mainHandler.postDelayed(retry15s, 15000L)
+
+                // Stage 3: Strict timeout -> fail cleanly without downloading
+                val timeout30s = Runnable {
+                    activity.runOnUiThread {
+                        if (activeDownloadSearchAttemptId != attemptId || isShowingDownloadAd || downloadAdState == "SHOWING") {
+                            return@runOnUiThread
+                        }
+                        Log.w(TAG, "AdMob [Download]: Search timeout for attempt $attemptId. Download blocked.")
+                        cancelDownloadSearchRunnables()
+                        revokeVerifiedDownloadReward(attemptId, episodeKey)
+                        activeDownloadSearchAttemptId = ""
+                        currentDownloadAttemptId = ""
+                        downloadAdState = "FAILED"
+                        isLoadingDownloadAd = false
+                        notifyDownloadAdResult(false, "timeout", attemptId, episodeKey)
+                    }
+                }
+                downloadTimeout30sRunnable = timeout30s
+                val effectiveTimeout = if (timeoutMs in 10000L..45000L) timeoutMs else 30000L
+                mainHandler.postDelayed(timeout30s, effectiveTimeout)
+            }
+        }
+
+        private fun showLoadedDownloadAd(
+            rewardedAd: RewardedAd,
+            attemptId: String,
+            episodeFid: String,
+            episodeIdx: Int,
+            episodeKey: String
+        ) {
+            cancelDownloadSearchRunnables()
+            isLoadingDownloadAd = false
+            isShowingDownloadAd = true
+            downloadAdState = "SHOWING"
+
+            var userEarnedReward = false
+            var isTerminalStateHandled = false
+
+            rewardedAd.fullScreenContentCallback = object : FullScreenContentCallback() {
+                override fun onAdShowedFullScreenContent() {
+                    activity.runOnUiThread {
+                        Log.d(TAG, "AdMob [Download]: [Show] Download ad is SHOWING for attempt $attemptId")
+                        isShowingDownloadAd = true
+                        downloadAdState = "SHOWING"
+                        notifyDownloadAdShowed(attemptId)
+                    }
+                }
+
+                override fun onAdDismissedFullScreenContent() {
+                    activity.runOnUiThread {
+                        Log.d(TAG, "AdMob [Download]: [Dismiss] Attempt $attemptId dismissed (rewardEarned=$userEarnedReward)")
+                        isShowingDownloadAd = false
+                        downloadAdState = "DISMISSED"
+                        activity.applyImmersiveFullScreen()
+
+                        if (!isTerminalStateHandled && (activeDownloadSearchAttemptId == attemptId || currentDownloadAttemptId == attemptId)) {
+                            isTerminalStateHandled = true
+                            activeDownloadSearchAttemptId = ""
+                            currentDownloadAttemptId = ""
+                            downloadAdState = "IDLE"
+
+                            if (userEarnedReward) {
+                                Log.d(TAG, "AdMob [Download]: [Download Permitted] Reward verified inside OnUserEarnedRewardListener for $episodeKey!")
+                                notifyDownloadAdResult(true, "watched", attemptId, episodeKey)
+                            } else {
+                                Log.w(TAG, "AdMob [Download]: [Download Blocked] Ad dismissed early before OnUserEarnedRewardListener!")
+                                revokeVerifiedDownloadReward(attemptId, episodeKey)
+                                notifyDownloadAdResult(false, "dismissed_early", attemptId, episodeKey)
+                            }
+                        }
+
+                        mainHandler.postDelayed({
+                            preloadDownloadAd("post_download_ad_dismiss")
+                        }, 1000L)
+                    }
+                }
+
+                override fun onAdFailedToShowFullScreenContent(adError: AdError) {
+                    activity.runOnUiThread {
+                        Log.e(TAG, "AdMob [Download]: [Show Failed] Attempt $attemptId - Code: ${adError.code}, Message: ${adError.message}")
+                        isShowingDownloadAd = false
+                        downloadAdState = "FAILED"
+                        activity.applyImmersiveFullScreen()
+
+                        if (!isTerminalStateHandled && (activeDownloadSearchAttemptId == attemptId || currentDownloadAttemptId == attemptId)) {
+                            isTerminalStateHandled = true
+                            activeDownloadSearchAttemptId = ""
+                            currentDownloadAttemptId = ""
+                            revokeVerifiedDownloadReward(attemptId, episodeKey)
+                            notifyDownloadAdResult(false, "failed_to_show", attemptId, episodeKey)
+                        }
+
+                        mainHandler.postDelayed({
+                            preloadDownloadAd("post_download_show_failed")
+                        }, 1000L)
+                    }
+                }
+            }
+
+            try {
+                rewardedAd.show(activity) { rewardItem ->
+                    userEarnedReward = true
+                    grantVerifiedDownloadReward(attemptId, episodeKey)
+                    Log.d(
+                        TAG,
+                        "AdMob [Download]: [Reward Earned] OnUserEarnedRewardListener fired for $attemptId ($episodeKey) - Type: ${rewardItem.type}, Amount: ${rewardItem.amount}"
+                    )
+                    notifyDownloadAdRewardEarned(attemptId, episodeKey)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "AdMob [Download]: Exception showing rewarded ad for $attemptId: ${e.message}", e)
+                isShowingDownloadAd = false
+                isLoadingDownloadAd = false
+                downloadAdState = "FAILED"
+                revokeVerifiedDownloadReward(attemptId, episodeKey)
+                if (!isTerminalStateHandled && (activeDownloadSearchAttemptId == attemptId || currentDownloadAttemptId == attemptId)) {
+                    isTerminalStateHandled = true
+                    activeDownloadSearchAttemptId = ""
+                    currentDownloadAttemptId = ""
+                    notifyDownloadAdResult(false, "exception", attemptId, episodeKey)
+                }
+            }
+        }
+
         // ================= Backward Compatibility Dispatcher =================
         @JavascriptInterface
         fun loadAndShowRewardedAd(adUnitId: String, timeoutMs: Long) {
@@ -4114,7 +4661,9 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun loadAndShowRewardedAd(adUnitId: String, timeoutMs: Long, attemptId: String) {
-            if (adUnitId.contains("9116970862") || adUnitId == EPISODE_REWARDED_AD_UNIT_ID) {
+            if (adUnitId.contains("9003880054") || adUnitId == DOWNLOAD_REWARDED_AD_UNIT_ID) {
+                loadAndShowDownloadAd(timeoutMs, attemptId, "", 0, "")
+            } else if (adUnitId.contains("9116970862") || adUnitId == EPISODE_REWARDED_AD_UNIT_ID) {
                 loadAndShowEpisodeAd(timeoutMs, attemptId, "", 0)
             } else {
                 loadAndShowFiveAds(timeoutMs, attemptId)
@@ -4150,6 +4699,21 @@ class MainActivity : ComponentActivity() {
         private fun notifyEpisodeResult(success: Boolean, reason: String, attemptId: String, episodeFid: String, episodeIdx: Int) {
             val escapedFid = JSONObject.quote(episodeFid)
             val script = "if(window.onEpisodeResult){window.onEpisodeResult($success,'$reason','$attemptId',$escapedFid,$episodeIdx);}if(window.onAdMobRewardResult){window.onAdMobRewardResult($success,'$reason','$attemptId');}"
+            webView.evaluateJavascript(script, null)
+        }
+
+        private fun notifyDownloadAdShowed(attemptId: String) {
+            val script = "if(window.onDownloadAdShowed){window.onDownloadAdShowed(${JSONObject.quote(attemptId)});}"
+            webView.evaluateJavascript(script, null)
+        }
+
+        private fun notifyDownloadAdRewardEarned(attemptId: String, episodeKey: String) {
+            val script = "if(window.onDownloadAdRewardEarned){window.onDownloadAdRewardEarned(${JSONObject.quote(attemptId)},${JSONObject.quote(episodeKey)});}"
+            webView.evaluateJavascript(script, null)
+        }
+
+        private fun notifyDownloadAdResult(success: Boolean, reason: String, attemptId: String, episodeKey: String) {
+            val script = "if(window.onDownloadAdResult){window.onDownloadAdResult($success,${JSONObject.quote(reason)},${JSONObject.quote(attemptId)},${JSONObject.quote(episodeKey)});}"
             webView.evaluateJavascript(script, null)
         }
 

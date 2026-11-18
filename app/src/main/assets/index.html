@@ -58,7 +58,6 @@ body.light-mode .top-ad-support-btn{background:rgba(229,9,20,0.08);border-color:
   justify-content: center;
   font-size: 13px;
   transition: transform 0.15s ease, color 0.15s ease;
-  backdrop-filter: blur(4px);
 }
 .favorite-btn:active {
   transform: scale(0.9);
@@ -132,7 +131,6 @@ body.light-mode .top-ad-support-btn{background:rgba(229,9,20,0.08);border-color:
   font-weight: 800;
   padding: 2px 7px;
   border-radius: 8px;
-  backdrop-filter: blur(4px);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
   z-index: 2;
   line-height: 1.2;
@@ -4259,6 +4257,20 @@ body.light-mode .details-main-title.is-expanded {
     </div>
   </div>
 
+  <!-- Download Episode Rewarded Ad Confirmation Dialog -->
+  <div id="downloadAdConfirmPopup" class="ad-overlay" style="display:none;z-index:2510">
+    <div class="ad-popup-card">
+      <div class="ad-popup-icon" id="downloadAdPopupIcon">⬇️</div>
+      <h2 class="ad-popup-title" id="downloadAdPopupTitle">تحميل الحلقة</h2>
+      <p class="ad-popup-desc" id="downloadAdPopupDesc">لمتابعة تحميل الحلقة، يجب مشاهدة إعلان قصير.</p>
+      <div id="downloadAdStatusMsg" style="display:none;margin-bottom:16px;font-size:13px;padding:10px 14px;border-radius:12px;line-height:1.5;background:#1a1010;border:1px solid #4a1515;color:#ff8888"></div>
+      <div class="ad-popup-actions" id="downloadAdPopupActions" style="display:flex;flex-direction:row;justify-content:center;gap:10px">
+        <button type="button" class="ad-btn-primary" id="downloadAdOkBtn" onclick="window.confirmDownloadAdWatch()" style="flex:1">موافق</button>
+        <button type="button" class="ad-btn-secondary" id="downloadAdCancelBtn" onclick="window.cancelDownloadAdWatch()" style="flex:1">إلغاء</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Ad Watching Fullscreen Overlay -->
   <div id="adWatchScreen" class="ad-watch-view" style="display:none">
     <div class="ad-counter-ring">
@@ -4926,25 +4938,75 @@ window.setupHeroSliderTouch = function() {
   }, { passive: true });
 };
 
+window._viewsScoreCache = window._viewsScoreCache || new Map();
+window._watchedEpisodesCache = window._watchedEpisodesCache || new Map();
+window._homeViewDirtyRevision = 0;
+
+window._invalidateItemViewCache = function(fid) {
+  if (fid) {
+    window._viewsScoreCache.delete(fid);
+  }
+  window._homeViewDirtyRevision++;
+};
+
+window._resetAllViewCaches = function() {
+  window._viewsScoreCache.clear();
+  window._watchedEpisodesCache.clear();
+  window._homeViewDirtyRevision++;
+};
+
+window._setWatchedCacheState = function(fid, idx, isWatched) {
+  if (!fid) return;
+  const cacheKey = `${fid}_${idx}`;
+  window._watchedEpisodesCache.set(cacheKey, Boolean(isWatched));
+  window._viewsScoreCache.delete(fid);
+  window._homeViewDirtyRevision++;
+};
+
 window.getItemViews = function(item) {
   if (!item) return 0;
+  const fid = item.firebaseId;
+  if (fid && window._viewsScoreCache.has(fid)) {
+    return window._viewsScoreCache.get(fid);
+  }
   let baseViews = parseInt(item.views || item.viewCount || item.viewsCount || 0, 10) || 0;
-  let localViews = parseInt(localStorage.getItem(`views_${item.firebaseId}`) || "0", 10) || 0;
+  let localViews = 0;
+  try {
+    localViews = parseInt(localStorage.getItem(`views_${fid}`) || "0", 10) || 0;
+  } catch (_) {}
   let watchedBonus = 0;
   let eps = Array.isArray(item.episodes) ? item.episodes : [];
   for (let i = 0; i < eps.length; i++) {
-    if (localStorage.getItem(`watched_${item.firebaseId}_${i}`) === "true") {
+    const cacheKey = `${fid}_${i}`;
+    let watched = window._watchedEpisodesCache.get(cacheKey);
+    if (watched === undefined) {
+      try {
+        watched = (localStorage.getItem(`watched_${cacheKey}`) === "true");
+      } catch (_) {
+        watched = false;
+      }
+      window._watchedEpisodesCache.set(cacheKey, watched);
+    }
+    if (watched) {
       watchedBonus += 15;
     }
   }
   let favBonus = (window.favorites || []).includes(item.id) ? 20 : 0;
-  return baseViews + localViews + watchedBonus + favBonus;
+  const score = baseViews + localViews + watchedBonus + favBonus;
+  if (fid) {
+    window._viewsScoreCache.set(fid, score);
+  }
+  return score;
 };
 
 window.incrementItemViews = function(fid) {
   if (!fid) return;
-  let current = parseInt(localStorage.getItem(`views_${fid}`) || "0", 10) || 0;
-  localStorage.setItem(`views_${fid}`, (current + 1).toString());
+  let current = 0;
+  try {
+    current = parseInt(localStorage.getItem(`views_${fid}`) || "0", 10) || 0;
+    localStorage.setItem(`views_${fid}`, (current + 1).toString());
+  } catch (_) {}
+  window._invalidateItemViewCache(fid);
 };
 
 /* ================= ALL GENRES & FILTER SYSTEM ================= */
@@ -6161,42 +6223,80 @@ window.requestNotifPermission = function() {
   }
 };
 
-// ================= Custom Notification Modal & Firebase Broadcast Controller =================
+// ================= Custom Notification Modal & Role-Gated Firebase Broadcast Controller =================
 window.registeredFcmDevices = [];
 window.recentBroadcastNotifications = [];
 
 const devicesColRef = collection(db, "fcm_devices");
 const notifsColRef = collection(db, "app_notifications");
+window._fcmDevicesUnsubscribe = null;
+window._appNotifsUnsubscribe = null;
 
-onSnapshot(devicesColRef, (snap) => {
-  window.registeredFcmDevices = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const badge = document.getElementById("notifModalDeviceCountBadge");
-  if (badge) {
-    const activeCount = window.registeredFcmDevices.filter(d => d.notificationsEnabled !== false).length || window.registeredFcmDevices.length || 1;
-    badge.innerText = `${activeCount} جهاز مشترك`;
+window.setupAdminNotificationListeners = function() {
+  if (window.currentUserRole !== "ADMIN") return;
+  if (!window._fcmDevicesUnsubscribe) {
+    window._fcmDevicesUnsubscribe = onSnapshot(devicesColRef, (snap) => {
+      window.registeredFcmDevices = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const badge = document.getElementById("notifModalDeviceCountBadge");
+      if (badge) {
+        const activeCount = window.registeredFcmDevices.filter(d => d.notificationsEnabled !== false).length || window.registeredFcmDevices.length || 1;
+        badge.innerText = `${activeCount} جهاز مشترك`;
+      }
+      const adminDevCounter = document.getElementById("adminRegisteredDevicesBadge");
+      if (adminDevCounter) {
+        const activeCount = window.registeredFcmDevices.filter(d => d.notificationsEnabled !== false).length || window.registeredFcmDevices.length || 1;
+        adminDevCounter.innerText = `📱 الأجهزة المشتركة (all_users): ${activeCount} جهاز`;
+      }
+    }, (err) => {
+      console.warn("fcm_devices listener warn:", err);
+    });
   }
-  const adminDevCounter = document.getElementById("adminRegisteredDevicesBadge");
-  if (adminDevCounter) {
-    const activeCount = window.registeredFcmDevices.filter(d => d.notificationsEnabled !== false).length || window.registeredFcmDevices.length || 1;
-    adminDevCounter.innerText = `📱 الأجهزة المشتركة (all_users): ${activeCount} جهاز`;
-  }
-}, (err) => {
-  console.warn("fcm_devices listener warn:", err);
-});
 
-const recentNotifsQuery = query(notifsColRef, orderBy("createdAtMs", "desc"), limit(5));
-onSnapshot(recentNotifsQuery, (snap) => {
-  window.recentBroadcastNotifications = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  const statusLogEl = document.getElementById("adminLastBroadcastStatus");
-  if (statusLogEl && window.recentBroadcastNotifications.length > 0) {
-    const latest = window.recentBroadcastNotifications[0];
-    const targetCnt = latest.targetDevicesCount || Math.max(1, window.registeredFcmDevices.length);
-    const delivCnt = Array.isArray(latest.deliveredDevices) ? latest.deliveredDevices.length : (latest.deliveredCount || 1);
-    statusLogEl.innerHTML = `✅ آخر إشعار مُرسل: <b>${window.escapeDescHtml(latest.title || "")}</b> — <span style="color:#4ade80">${ window.escapeDescHtml(latest.body || "") }</span> (وصل إلى <b>${delivCnt}</b> من <b>${targetCnt}</b> جهاز)`;
+  if (!window._appNotifsUnsubscribe) {
+    const recentNotifsQuery = query(notifsColRef, orderBy("createdAtMs", "desc"), limit(5));
+    window._appNotifsUnsubscribe = onSnapshot(recentNotifsQuery, (snap) => {
+      window.recentBroadcastNotifications = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      const statusLogEl = document.getElementById("adminLastBroadcastStatus");
+      if (statusLogEl && window.recentBroadcastNotifications.length > 0) {
+        const latest = window.recentBroadcastNotifications[0];
+        const targetCnt = latest.targetDevicesCount || Math.max(1, window.registeredFcmDevices.length);
+        const delivCnt = Array.isArray(latest.deliveredDevices) ? latest.deliveredDevices.length : (latest.deliveredCount || 1);
+        statusLogEl.innerHTML = `✅ آخر إشعار مُرسل: <b>${window.escapeDescHtml(latest.title || "")}</b> — <span style="color:#4ade80">${window.escapeDescHtml(latest.body || "")}</span> (وصل إلى <b>${delivCnt}</b> من <b>${targetCnt}</b> جهاز)`;
+      }
+    }, (err) => {
+      console.warn("app_notifications listener warn:", err);
+    });
   }
-}, (err) => {
-  console.warn("app_notifications listener warn:", err);
-});
+};
+
+window.teardownAdminNotificationListeners = function() {
+  if (window._fcmDevicesUnsubscribe) {
+    try { window._fcmDevicesUnsubscribe(); } catch (_) {}
+    window._fcmDevicesUnsubscribe = null;
+  }
+  if (window._appNotifsUnsubscribe) {
+    try { window._appNotifsUnsubscribe(); } catch (_) {}
+    window._appNotifsUnsubscribe = null;
+  }
+};
+
+window.syncAdminListenersByRole = function(role) {
+  const norm = String(role || "").toUpperCase();
+  if (norm === "ADMIN") {
+    if (typeof window.setupAdminNotificationListeners === "function") window.setupAdminNotificationListeners();
+    if (typeof window.setupReportsListener === "function") window.setupReportsListener();
+    if (typeof window.ensureProfileAvatarsSynced === "function") window.ensureProfileAvatarsSynced();
+  } else if (norm === "ASSISTANT") {
+    if (typeof window.teardownAdminNotificationListeners === "function") window.teardownAdminNotificationListeners();
+    if (typeof window.setupReportsListener === "function") window.setupReportsListener();
+  } else {
+    if (typeof window.teardownAdminNotificationListeners === "function") window.teardownAdminNotificationListeners();
+    if (typeof window.teardownReportsListener === "function") window.teardownReportsListener();
+    if (currentPage !== "avatar_picker" && typeof window.teardownProfileAvatarsListener === "function") {
+      window.teardownProfileAvatarsListener();
+    }
+  }
+};
 
 window.updateNotifModalPosterPreview = function(url) {
   const cleanUrl = (url || "").trim();
@@ -6475,8 +6575,14 @@ window.currentWatchingEpisode = {
 };
 
 window.isEpisodeWatched = function(fid, idx) {
+  const key = `${fid}_${idx}`;
+  if (window._watchedEpisodesCache && window._watchedEpisodesCache.has(key)) {
+    return window._watchedEpisodesCache.get(key);
+  }
   try {
-    return localStorage.getItem(`watched_${fid}_${idx}`) === "true";
+    const val = localStorage.getItem(`watched_${key}`) === "true";
+    if (window._watchedEpisodesCache) window._watchedEpisodesCache.set(key, val);
+    return val;
   } catch(e) {
     return false;
   }
@@ -6495,6 +6601,7 @@ window.setEpisodeWatchedSeconds = function(fid, idx, seconds) {
     localStorage.setItem(`watched_sec_${fid}_${idx}`, seconds.toString());
     if (seconds >= 300) {
       localStorage.setItem(`watched_${fid}_${idx}`, "true");
+      if (window._setWatchedCacheState) window._setWatchedCacheState(fid, idx, true);
     }
   } catch(e) {}
 };
@@ -6503,6 +6610,7 @@ window.markEpisodeAsWatched = function(fid, idx) {
   try {
     localStorage.setItem(`watched_${fid}_${idx}`, "true");
     localStorage.setItem(`watched_sec_${fid}_${idx}`, "300");
+    if (window._setWatchedCacheState) window._setWatchedCacheState(fid, idx, true);
   } catch(e) {}
 };
 
@@ -6595,6 +6703,9 @@ window.clearUserRole = function() {
   window.currentAdminClaim = false;
   window.currentAssistantClaim = false;
   window.currentFirestoreRole = "";
+  if (typeof window.syncAdminListenersByRole === "function") {
+    window.syncAdminListenersByRole("");
+  }
 };
 
 window.applyUserRole = function(role) {
@@ -6613,6 +6724,9 @@ window.applyUserRole = function(role) {
 
   window.currentUserRole = effectiveRole;
   window.isAdminUnlocked = (effectiveRole === "ADMIN");
+  if (typeof window.syncAdminListenersByRole === "function") {
+    window.syncAdminListenersByRole(effectiveRole);
+  }
 
   const addNavBtn = document.getElementById("nav-add");
   if (addNavBtn) addNavBtn.style.display = effectiveRole === "ADMIN" ? "flex" : "none";
@@ -8386,27 +8500,44 @@ window.onPosterError = function(img, origUrl) {
   if (ph) ph.classList.add("hidden");
 };
 
-// Smart Preload Helper: Preloads upcoming posters in background without blocking UI
+// Smart Preload Helper: Preloads upcoming posters in background with cancellation on navigation
+window._posterPreloadTimers = window._posterPreloadTimers || [];
+
+window.cancelPendingPosterPreloads = function() {
+  if (Array.isArray(window._posterPreloadTimers) && window._posterPreloadTimers.length > 0) {
+    for (let i = 0; i < window._posterPreloadTimers.length; i++) {
+      clearTimeout(window._posterPreloadTimers[i]);
+    }
+    window._posterPreloadTimers.length = 0;
+  }
+};
+
 window.preloadPosters = function(items, count = 12) {
   if (!Array.isArray(items) || items.length === 0) return;
-  const candidates = items.slice(0, count);
+  window.cancelPendingPosterPreloads();
+  const candidates = items.slice(0, Math.min(count, 16));
   const runPreload = () => {
-    candidates.forEach((it, idx) => {
+    let delayStep = 0;
+    for (let i = 0; i < candidates.length; i++) {
+      const it = candidates[i];
       const url = (it && (it.poster || it.image || "")) ? (it.poster || it.image).trim() : "";
       if (url && /^https?:/i.test(url) && !window._posterMemoryCache.has(url)) {
-        setTimeout(() => {
+        const tId = setTimeout(() => {
           const pre = new Image();
           pre.decoding = "async";
           pre.src = url;
           pre.onload = () => window.markPosterCached(url);
-        }, idx * 60);
+        }, delayStep * 55);
+        window._posterPreloadTimers.push(tId);
+        delayStep++;
       }
-    });
+    }
   };
   if (typeof window.requestIdleCallback === "function") {
-    window.requestIdleCallback(runPreload, { timeout: 2000 });
+    window.requestIdleCallback(runPreload, { timeout: 1500 });
   } else {
-    setTimeout(runPreload, 100);
+    const tId = setTimeout(runPreload, 80);
+    window._posterPreloadTimers.push(tId);
   }
 };
 
@@ -8460,6 +8591,41 @@ window.compareMoviesOrder = function(a, b) {
   return String(b.firebaseId || b.id || "").localeCompare(String(a.firebaseId || a.id || ""));
 };
 
+window._contentByFid = window._contentByFid || new Map();
+window._contentRevision = window._contentRevision || 0;
+window._offlineCacheSaveTimer = null;
+
+window.rebuildContentIndex = function() {
+  const map = new Map();
+  const list = Array.isArray(window.allContent) ? window.allContent : [];
+  for (let i = 0; i < list.length; i++) {
+    const item = list[i];
+    if (item && item.firebaseId) {
+      map.set(item.firebaseId, item);
+    }
+  }
+  window._contentByFid = map;
+};
+
+window.scheduleOfflineMoviesCacheSave = function() {
+  if (window._offlineCacheSaveTimer) {
+    clearTimeout(window._offlineCacheSaveTimer);
+  }
+  window._offlineCacheSaveTimer = setTimeout(() => {
+    window._offlineCacheSaveTimer = null;
+    const writeCache = () => {
+      try {
+        localStorage.setItem("movies_offline_cache", JSON.stringify((window.allContent || []).slice(0, 100)));
+      } catch (_) {}
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(writeCache, { timeout: 2000 });
+    } else {
+      writeCache();
+    }
+  }, 600);
+};
+
 // Offline cache quick-load
 try {
   const cachedStr = localStorage.getItem("movies_offline_cache");
@@ -8467,6 +8633,7 @@ try {
     window.allContent = JSON.parse(cachedStr);
   }
 } catch(e) {}
+window.rebuildContentIndex();
 
 // ================= Progressive DOM Grid Helpers =================
 window.createCardElement = function(item) {
@@ -8573,11 +8740,11 @@ window.setupMoviesListener = function() {
       const parsedItems = s.docs.map(window.parseMovieDoc);
       parsedItems.sort(window.compareMoviesOrder);
       window.allContent = parsedItems;
-      window.preloadPosters(parsedItems, 20);
-
-      try {
-        localStorage.setItem("movies_offline_cache", JSON.stringify(parsedItems.slice(0, 100)));
-      } catch(e) {}
+      window.rebuildContentIndex();
+      window._contentRevision++;
+      if (window._resetAllViewCaches) window._resetAllViewCaches();
+      window.preloadPosters(parsedItems, 16);
+      window.scheduleOfflineMoviesCacheSave();
 
       // Handle FCM if pending
       if (window._pendingFcmNotification) {
@@ -8588,8 +8755,6 @@ window.setupMoviesListener = function() {
         }, 120);
       }
 
-      // Render the complete active page after the first Firestore snapshot so
-      // the home hero and all sections update without requiring navigation.
       console.info("[Firestore] Initial movies snapshot received:", window.allContent.length);
       try {
         renderCurrentPage();
@@ -8599,27 +8764,41 @@ window.setupMoviesListener = function() {
       return;
     }
 
-    // 2. Differential updates (docChanges) for subsequent snapshot events
-    changes.forEach(change => {
+    if (!changes || changes.length === 0) return;
+
+    // 2. Differential updates (docChanges): batch array mutations & sort once at the end
+    let needsSort = false;
+    let indexMutated = false;
+    const addedForActiveGrid = [];
+    const activeGrid = document.getElementById("categoryCardsGrid");
+
+    for (let i = 0; i < changes.length; i++) {
+      const change = changes[i];
       const parsed = window.parseMovieDoc(change.doc);
 
       if (change.type === "added") {
-        const exists = window.allContent.some(x => x.firebaseId === parsed.firebaseId);
-        if (!exists) {
+        if (!window._contentByFid.has(parsed.firebaseId)) {
           window.allContent.push(parsed);
-          window.allContent.sort(window.compareMoviesOrder);
+          window._contentByFid.set(parsed.firebaseId, parsed);
+          needsSort = true;
+          indexMutated = true;
         }
-        const activeGrid = document.getElementById("categoryCardsGrid");
         if (activeGrid) {
-          window.progressiveRenderItemIntoGrid(activeGrid, parsed);
+          addedForActiveGrid.push(parsed);
         }
       } else if (change.type === "modified") {
         const idx = window.allContent.findIndex(x => x.firebaseId === parsed.firebaseId);
         if (idx !== -1) {
           window.allContent[idx] = parsed;
-          window.allContent.sort(window.compareMoviesOrder);
+          needsSort = true;
+        } else {
+          window.allContent.push(parsed);
+          needsSort = true;
         }
-        // Update all DOM instances of this movie on the page without full re-render
+        window._contentByFid.set(parsed.firebaseId, parsed);
+        indexMutated = true;
+        if (window._invalidateItemViewCache) window._invalidateItemViewCache(parsed.firebaseId);
+
         document.querySelectorAll(`[data-card-fid="${parsed.firebaseId}"]`).forEach(card => {
           window.updateCardElement(card, parsed);
         });
@@ -8628,7 +8807,11 @@ window.setupMoviesListener = function() {
           window.updateDetailsRatingDisplay(parsed.firebaseId, parsed.ratingAverage, parsed.ratingCount, userScore);
         }
       } else if (change.type === "removed") {
+        window._contentByFid.delete(parsed.firebaseId);
         window.allContent = window.allContent.filter(x => x.firebaseId !== parsed.firebaseId);
+        indexMutated = true;
+        if (window._invalidateItemViewCache) window._invalidateItemViewCache(parsed.firebaseId);
+
         document.querySelectorAll(`[data-card-fid="${parsed.firebaseId}"]`).forEach(card => {
           card.style.transition = "all 0.25s ease";
           card.style.opacity = "0";
@@ -8636,7 +8819,20 @@ window.setupMoviesListener = function() {
           setTimeout(() => card.remove(), 250);
         });
       }
-    });
+    }
+
+    if (needsSort) {
+      window.allContent.sort(window.compareMoviesOrder);
+    }
+    if (indexMutated) {
+      window._contentRevision++;
+      window.scheduleOfflineMoviesCacheSave();
+    }
+    if (activeGrid && addedForActiveGrid.length > 0) {
+      for (let i = 0; i < addedForActiveGrid.length; i++) {
+        window.progressiveRenderItemIntoGrid(activeGrid, addedForActiveGrid[i]);
+      }
+    }
   };
 
   const handleError = (err) => {
@@ -8657,12 +8853,13 @@ window.setupMoviesListener = function() {
 // Initialize movies listener
 window.setupMoviesListener();
 
-window.getItemByFirebaseId=(fid)=>window.allContent.find(i=>i.firebaseId===fid);
+window.getItemByFirebaseId=(fid)=> (fid ? (window._contentByFid.get(fid) || window.allContent.find(i=>i.firebaseId===fid) || null) : null);
 window.isFavorite=(id)=>window.favorites.includes(id);
 window.toggleFavorite=(id)=>{
   if(window.isFavorite(id))window.favorites=window.favorites.filter(x=>x!==id);
   else window.favorites.push(id);
   localStorage.setItem("favorites",JSON.stringify(window.favorites));
+  if (window._resetAllViewCaches) window._resetAllViewCaches();
   renderCurrentPage();
 };
 window.setActiveNav=(p)=>{
@@ -8835,6 +9032,8 @@ window.getItemLandscapePoster = function(item) {
   return (item.poster || "").trim();
 };
 
+window._homeComputedCache = null;
+
 window.renderHome = () => {
   document.body.classList.remove("page-details-active", "page-episodes-active", "page-news-active");
   const globalTopBar = document.querySelector(".top-bar");
@@ -8857,8 +9056,42 @@ window.renderHome = () => {
     return;
   }
 
-  // 1. Featured Slider Items (up to 6 items with posters)
-  const featuredItems = all.filter(x => Boolean(x.poster || x.banner)).slice(0, 6);
+  const homeCacheKey = `${window._contentRevision || 0}_${window._homeViewDirtyRevision || 0}_${(window.favorites || []).length}`;
+  let featuredItems, newEpisodesItems, latestAddedItems, mostWatchedItems;
+
+  if (window._homeComputedCache && window._homeComputedCache.key === homeCacheKey) {
+    ({ featuredItems, newEpisodesItems, latestAddedItems, mostWatchedItems } = window._homeComputedCache);
+  } else {
+    // 1. Featured Slider Items (up to 6 items with posters)
+    featuredItems = [];
+    newEpisodesItems = [];
+    for (let i = 0; i < all.length; i++) {
+      const x = all[i];
+      if (!x) continue;
+      if (featuredItems.length < 6 && (x.poster || x.banner)) {
+        featuredItems.push(x);
+      }
+      if (newEpisodesItems.length < 14 && Array.isArray(x.episodes) && x.episodes.length > 0) {
+        newEpisodesItems.push(x);
+      }
+    }
+    latestAddedItems = all.slice(0, 14);
+    mostWatchedItems = [...all].sort((a, b) => {
+      let va = window.getItemViews(a);
+      let vb = window.getItemViews(b);
+      if (vb !== va) return vb - va;
+      return (b.episodes?.length || 0) - (a.episodes?.length || 0);
+    }).slice(0, 14);
+
+    window._homeComputedCache = {
+      key: homeCacheKey,
+      featuredItems,
+      newEpisodesItems,
+      latestAddedItems,
+      mostWatchedItems
+    };
+  }
+
   window.heroSlideTotal = featuredItems.length;
   window.heroSlideIndex = 0;
 
@@ -8890,7 +9123,6 @@ window.renderHome = () => {
   `).join("");
 
   // 2. New Episodes Section (items that have episodes)
-  const newEpisodesItems = all.filter(x => Array.isArray(x.episodes) && x.episodes.length > 0).slice(0, 14);
   const newEpisodesCardsHtml = newEpisodesItems.map(item => {
     const lastEpIdx = item.episodes.length - 1;
     const lastEp = item.episodes[lastEpIdx];
@@ -8920,8 +9152,7 @@ window.renderHome = () => {
     `;
   }).join("");
 
-  // 3. Latest Added Content (sorted by creation date newest first)
-  const latestAddedItems = [...all].slice(0, 14);
+  // 3 & 4 cards use cached latestAddedItems & mostWatchedItems from above
   const latestAddedCardsHtml = latestAddedItems.map(item => {
     let isAnimation = item.type === "animation" || item.type === "arabic" || item.type === "sports";
     let catLabel = item.category || (isAnimation ? "أنميشن" : "مسلسل");
@@ -8947,14 +9178,6 @@ window.renderHome = () => {
       </div>
     `;
   }).join("");
-
-  // 4. Most Watched (sorted by real views/engagement descending)
-  const mostWatchedItems = [...all].sort((a, b) => {
-    let va = window.getItemViews(a);
-    let vb = window.getItemViews(b);
-    if (vb !== va) return vb - va;
-    return (b.episodes?.length || 0) - (a.episodes?.length || 0);
-  }).slice(0, 14);
 
   const mostWatchedCardsHtml = mostWatchedItems.map((item, idx) => {
     let isAnimation = item.type === "animation" || item.type === "arabic" || item.type === "sports";
@@ -9077,6 +9300,36 @@ window.renderHome = () => {
   window.startHeroSlideAutoPlay();
   window.preloadPosters(all, 20);
 };
+window._activeGridRenderToken = window._activeGridRenderToken || 0;
+
+window.renderGridIncrementally = function(container, items, renderItemFn, batchSize = 24) {
+  if (!container) return;
+  const token = ++window._activeGridRenderToken;
+  if (!Array.isArray(items) || items.length === 0) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const firstChunk = items.slice(0, batchSize);
+  container.innerHTML = firstChunk.map(renderItemFn).join("");
+
+  if (items.length <= batchSize) return;
+
+  let offset = batchSize;
+  const appendNextBatch = () => {
+    if (token !== window._activeGridRenderToken || !container.isConnected) return;
+    const end = Math.min(offset + batchSize, items.length);
+    const tpl = document.createElement("template");
+    tpl.innerHTML = items.slice(offset, end).map(renderItemFn).join("");
+    container.appendChild(tpl.content);
+    offset = end;
+    if (offset < items.length) {
+      requestAnimationFrame(appendNextBatch);
+    }
+  };
+  requestAnimationFrame(appendNextBatch);
+};
+
 window.renderCategory=(type)=>{
   let isAnimation = type === "animation" || type === "arabic" || type === "sports";
   let catTitle = isAnimation ? t("cat_animation") : t("cat_anime");
@@ -9112,11 +9365,7 @@ window.renderCategory=(type)=>{
       </div>
     `;
   } else {
-    contentGridHtml = `
-      <div id="categoryCardsGrid" class="cards-grid-3">
-        ${items.map(createCard).join("")}
-      </div>
-    `;
+    contentGridHtml = `<div id="categoryCardsGrid" class="cards-grid-3"></div>`;
   }
 
   main.innerHTML=`
@@ -9137,6 +9386,10 @@ window.renderCategory=(type)=>{
     ${activeFiltersBanner}
     ${contentGridHtml}
   `;
+  if (items.length > 0) {
+    const grid = document.getElementById("categoryCardsGrid");
+    window.renderGridIncrementally(grid, items, createCard, 24);
+  }
   setActiveNav(isAnimation ? "animation" : "anime");
   window.updateTopFilterBadge();
 };
@@ -9218,7 +9471,34 @@ window.pushHistoryEntrySafely = function(pageKey) {
   historyStack.push(pageKey);
 };
 
+window._restoreScrollTimers = window._restoreScrollTimers || [];
+window._lastNavActionKey = "";
+window._lastNavActionTs = 0;
+
+window.cleanupBeforeNavigation = function() {
+  window._activeGridRenderToken = (window._activeGridRenderToken || 0) + 1;
+  if (typeof window.cancelPendingPosterPreloads === "function") {
+    window.cancelPendingPosterPreloads();
+  }
+  if (Array.isArray(window._restoreScrollTimers) && window._restoreScrollTimers.length > 0) {
+    for (let i = 0; i < window._restoreScrollTimers.length; i++) {
+      clearTimeout(window._restoreScrollTimers[i]);
+    }
+    window._restoreScrollTimers.length = 0;
+  }
+  if (window.heroSlideTimer) {
+    clearInterval(window.heroSlideTimer);
+    window.heroSlideTimer = null;
+  }
+};
+
 window.restorePageScroll = function(targetScroll) {
+  if (Array.isArray(window._restoreScrollTimers) && window._restoreScrollTimers.length > 0) {
+    for (let i = 0; i < window._restoreScrollTimers.length; i++) {
+      clearTimeout(window._restoreScrollTimers[i]);
+    }
+    window._restoreScrollTimers.length = 0;
+  }
   if (typeof targetScroll !== "number" || targetScroll <= 0) {
     window.scrollTo(0, 0);
     return;
@@ -9226,13 +9506,20 @@ window.restorePageScroll = function(targetScroll) {
   window.scrollTo(0, targetScroll);
   requestAnimationFrame(() => {
     window.scrollTo(0, targetScroll);
-    setTimeout(() => { window.scrollTo(0, targetScroll); }, 40);
-    setTimeout(() => { window.scrollTo(0, targetScroll); }, 120);
-    setTimeout(() => { window.scrollTo(0, targetScroll); }, 240);
+    window._restoreScrollTimers.push(setTimeout(() => { window.scrollTo(0, targetScroll); }, 40));
+    window._restoreScrollTimers.push(setTimeout(() => { window.scrollTo(0, targetScroll); }, 140));
   });
 };
 
 window.navigateTo=(next,renderFn)=>{
+  const now = Date.now();
+  if (next !== "details" && window._lastNavActionKey === next && (now - window._lastNavActionTs) < 220) {
+    return;
+  }
+  window._lastNavActionKey = next;
+  window._lastNavActionTs = now;
+
+  window.cleanupBeforeNavigation();
   window.saveCurrentPageScroll();
   window.clearActiveInputBeforeNav();
   if (currentPage !== next) {
@@ -9340,6 +9627,9 @@ window.episodesSortOrder = "asc";
 window.renderEpisodesList = function(fid) {
   let item = getItemByFirebaseId(fid);
   if (!item) return;
+  if (typeof window.refreshDownloadedKeysCache === "function") {
+    window.refreshDownloadedKeysCache(true);
+  }
 
   let container = document.getElementById("episodesListContainer");
   let btn = document.getElementById("epSortBtn");
@@ -10889,7 +11179,47 @@ window.getEpisodeDownloadUrl = function(item, ep) {
   return window.normalizeVideoUrl(raw);
 };
 
+window._downloadedKeysSet = null;
+
+window.refreshDownloadedKeysCache = function(force = false) {
+  if (!force && window._downloadedKeysSet instanceof Set) {
+    return window._downloadedKeysSet;
+  }
+  const nextSet = new Set();
+  try {
+    if (window.AndroidBridge && typeof window.AndroidBridge.getDownloadedEpisodeKeysJson === "function") {
+      const raw = window.AndroidBridge.getDownloadedEpisodeKeysJson();
+      const arr = JSON.parse(raw || "[]");
+      if (Array.isArray(arr)) {
+        for (let i = 0; i < arr.length; i++) {
+          if (arr[i]) nextSet.add(String(arr[i]));
+        }
+        window._downloadedKeysSet = nextSet;
+        return nextSet;
+      }
+    }
+    if (window.AndroidBridge && typeof window.AndroidBridge.getDownloadedEpisodesList === "function") {
+      const rawList = window.AndroidBridge.getDownloadedEpisodesList();
+      const arr = JSON.parse(rawList || "[]");
+      if (Array.isArray(arr)) {
+        for (let i = 0; i < arr.length; i++) {
+          const k = arr[i] && (arr[i].episodeKey || arr[i].key);
+          if (k) nextSet.add(String(k));
+        }
+        window._downloadedKeysSet = nextSet;
+        return nextSet;
+      }
+    }
+  } catch (e) {
+    console.warn("refreshDownloadedKeysCache error", e);
+  }
+  return null;
+};
+
 window.isEpisodeDownloaded = function(episodeKey) {
+  if (window._downloadedKeysSet instanceof Set) {
+    return window._downloadedKeysSet.has(episodeKey);
+  }
   try {
     if (window.AndroidBridge && typeof window.AndroidBridge.isEpisodeDownloaded === "function") {
       return Boolean(window.AndroidBridge.isEpisodeDownloaded(episodeKey));
@@ -10915,6 +11245,44 @@ window.showDownloadNotice = function(msg, isSuccess = false) {
   }, 3500);
 };
 
+window._lastDownloadTapKey = "";
+window._lastDownloadTapAt = 0;
+
+window.proceedWithConfirmedDownload = function(target, confirmedAttemptId) {
+  if (!target || !target.videoUrl || !target.episodeKey) return false;
+  if (window._downloadAdRewardVerified !== true) {
+    console.warn("DownloadAd: Blocked proceedWithConfirmedDownload — reward not verified.");
+    return false;
+  }
+  const { fid, idx, videoUrl, animeTitle, epTitle, episodeKey } = target;
+
+  window.downloadingEpisodes[episodeKey] = {
+    status: "DOWNLOADING",
+    progress: 0,
+    title: epTitle,
+    fid: fid,
+    idx: idx
+  };
+  window.updateDownloadButtonUi(episodeKey, "DOWNLOADING", 0);
+
+  if (window.AndroidBridge && typeof window.AndroidBridge.downloadEpisodeWithReward === "function") {
+    const res = window.AndroidBridge.downloadEpisodeWithReward(videoUrl, animeTitle, epTitle, episodeKey, confirmedAttemptId || "");
+    if (res === "AD_REWARD_REQUIRED") {
+      delete window.downloadingEpisodes[episodeKey];
+      window.updateDownloadButtonUi(episodeKey, "FAILED", 0);
+      window.showDownloadNotice("لم تكتمل مشاهدة الإعلان، يرجى مشاهدة الإعلان أولاً.");
+      return false;
+    }
+    return true;
+  }
+  if (window.AndroidBridge && typeof window.AndroidBridge.downloadEpisode === "function") {
+    window.AndroidBridge.downloadEpisode(videoUrl, animeTitle, epTitle, episodeKey);
+    return true;
+  }
+  window.open(videoUrl, "_blank");
+  return true;
+};
+
 window.startDownloadEpisode = function(fid, idx, event) {
   if (event) {
     event.stopPropagation();
@@ -10933,6 +11301,13 @@ window.startDownloadEpisode = function(fid, idx, event) {
   let ep = (idx >= 0 && idx < episodes.length) ? episodes[idx] : episodes[0];
   let videoUrl = window.getEpisodeDownloadUrl(item, ep);
   let episodeKey = `${fid}_${idx}`;
+
+  const now = Date.now();
+  if (window._lastDownloadTapKey === episodeKey && (now - window._lastDownloadTapAt) < 350) {
+    return;
+  }
+  window._lastDownloadTapKey = episodeKey;
+  window._lastDownloadTapAt = now;
 
   // 2. Validate URL and downloadable format
   if (!videoUrl) {
@@ -10969,22 +11344,12 @@ window.startDownloadEpisode = function(fid, idx, event) {
     }
   }
 
-  // 5. Start Download via Native Android Bridge
+  // 5. Require Rewarded Ad confirmation before starting download (Download Ad Unit)
   let animeTitle = (item.title || "MY CINEMA").trim();
   let epTitle = (ep.title || `الحلقة ${idx + 1}`).trim();
-
-  window.downloadingEpisodes[episodeKey] = {
-    status: "DOWNLOADING",
-    progress: 0,
-    title: epTitle
-  };
-
-  window.updateDownloadButtonUi(episodeKey, "DOWNLOADING", 0);
-
-  if (window.AndroidBridge && typeof window.AndroidBridge.downloadEpisode === "function") {
-    window.AndroidBridge.downloadEpisode(videoUrl, animeTitle, epTitle, episodeKey);
-  } else {
-    window.open(videoUrl, "_blank");
+  window._downloadAdRewardVerified = false;
+  if (typeof window.showDownloadAdConfirmPopup === "function") {
+    window.showDownloadAdConfirmPopup(fid, idx, videoUrl, animeTitle, epTitle, episodeKey);
   }
 };
 
@@ -11028,6 +11393,9 @@ window.onEpisodeDownloadProgress = function(episodeKey, progress, status) {
 window.onEpisodeDownloadStatusChanged = function(episodeKey, status, progress, fileName) {
   if (status === "COMPLETED") {
     window.downloadingEpisodes[episodeKey] = { status: "COMPLETED", progress: 100 };
+    if (window._downloadedKeysSet instanceof Set) {
+      window._downloadedKeysSet.add(episodeKey);
+    }
     window.updateDownloadButtonUi(episodeKey, "COMPLETED", 100);
   } else if (status === "FAILED") {
     delete window.downloadingEpisodes[episodeKey];
@@ -11059,6 +11427,9 @@ window.toggleEpisodeWatched = function(fid, idx, event) {
     }
   } catch(e) {
     console.warn("Storage write error", e);
+  }
+  if (window._setWatchedCacheState) {
+    window._setWatchedCacheState(fid, idx, nextWatched);
   }
 
   // Update button in-place without page reloading
@@ -11174,6 +11545,9 @@ window.markAllEpisodesWatched = function(fid, isWatched) {
       if (isWatched) localStorage.setItem(`watched_sec_${fid}_${i}`, "300");
       else localStorage.removeItem(`watched_sec_${fid}_${i}`);
     } catch(e) {}
+    if (window._setWatchedCacheState) {
+      window._setWatchedCacheState(fid, i, Boolean(isWatched));
+    }
   }
   window.renderEpisodesPage(fid);
 };
@@ -11185,6 +11559,9 @@ window.renderEpisodesPage = function(fid) {
     return;
   }
   window._lastDetailsFid = fid;
+  if (typeof window.refreshDownloadedKeysCache === "function") {
+    window.refreshDownloadedKeysCache(true);
+  }
 
   document.body.classList.add("page-episodes-active");
   document.body.classList.remove("page-details-active");
@@ -11215,7 +11592,7 @@ window.renderEpisodesPage = function(fid) {
   } else {
     let fallbackThumb = item.poster || "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='140' viewBox='0 0 240 140'><rect width='240' height='140' fill='%231e293b'/><circle cx='120' cy='70' r='24' fill='%23334155'/><polygon points='115,58 130,70 115,82' fill='%23ffffff'/></svg>";
 
-    let cardsHtml = list.map(({ ep, originalIdx }) => {
+    window._buildEpisodeCardHtml = function({ ep, originalIdx }) {
       let rawTitle = (ep.title || "").trim();
       let displayTitle = rawTitle || `الحلقة ${originalIdx + 1}`;
       let escapedTitle = window.escapeDescHtml(displayTitle);
@@ -11255,7 +11632,7 @@ window.renderEpisodesPage = function(fid) {
         <div class="episode-hcard ${isWatched ? 'is-watched' : ''}" id="ep-card-${item.firebaseId}-${originalIdx}" data-ep-title="${escapedTitle}" data-ep-num="${originalIdx + 1}" onclick="watchEpisode('${item.firebaseId}', ${originalIdx})">
           <!-- Left: Thumbnail Image -->
           <div class="ep-hcard-thumb-wrap">
-            <img class="ep-hcard-thumb" src="${thumbSrc}" alt="${escapedTitle}" loading="lazy" onerror="this.onerror=null;this.src='${fallbackThumb}'">
+            <img class="ep-hcard-thumb" src="${thumbSrc}" alt="${escapedTitle}" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='${fallbackThumb}'">
           </div>
 
           <!-- Middle: Episode Title -->
@@ -11273,7 +11650,10 @@ window.renderEpisodesPage = function(fid) {
           </div>
         </div>
       `;
-    }).join("");
+    };
+
+    const useChunking = (list.length > 50 && !(window._episodesSearchActive && window._episodesSearchQuery));
+    let cardsHtml = useChunking ? "" : list.map(window._buildEpisodeCardHtml).join("");
 
     let containerClass = (window._episodesViewMode === "grid") ? "episodes-cards-grid" : "episodes-cards-list";
     episodesListHtml = `
@@ -11346,6 +11726,11 @@ window.renderEpisodesPage = function(fid) {
       </div>
     </div>
   `;
+
+  if (list.length > 50 && !(window._episodesSearchActive && window._episodesSearchQuery) && typeof window.renderGridIncrementally === "function" && typeof window._buildEpisodeCardHtml === "function") {
+    const epContainer = document.getElementById("episodesCardsContainer");
+    window.renderGridIncrementally(epContainer, list, window._buildEpisodeCardHtml, 40);
+  }
 
   if (window._episodesSearchActive && window._episodesSearchQuery) {
     window.filterEpisodesInDom(fid);
@@ -11471,44 +11856,55 @@ window.normalizeSearchText = function(str) {
     .replace(/\s+/g, " ");               // Collapse whitespace
 };
 
+window.getItemSearchBlob = function(item) {
+  if (!item) return "";
+  if (typeof item._searchBlob === "string") return item._searchBlob;
+  const parts = [];
+  if (item.title) parts.push(window.normalizeSearchText(item.title));
+  if (Array.isArray(item.alternativeTitles)) {
+    for (let i = 0; i < item.alternativeTitles.length; i++) {
+      if (item.alternativeTitles[i]) parts.push(window.normalizeSearchText(item.alternativeTitles[i]));
+    }
+  }
+  if (item.category) parts.push(window.normalizeSearchText(item.category));
+  if (item.type) parts.push(window.normalizeSearchText(item.type));
+  const itemGenres = window.getItemGenres(item);
+  for (let i = 0; i < itemGenres.length; i++) {
+    if (itemGenres[i]) parts.push(window.normalizeSearchText(itemGenres[i]));
+  }
+  if (item.version) parts.push(window.normalizeSearchText(item.version));
+  if (item.description) parts.push(window.normalizeSearchText(item.description));
+  const episodes = Array.isArray(item.episodes) ? item.episodes : [];
+  for (let i = 0; i < episodes.length; i++) {
+    const ep = episodes[i];
+    if (!ep) continue;
+    if (ep.title) parts.push(window.normalizeSearchText(ep.title));
+    if (Array.isArray(ep.alternativeTitles)) {
+      for (let j = 0; j < ep.alternativeTitles.length; j++) {
+        if (ep.alternativeTitles[j]) parts.push(window.normalizeSearchText(ep.alternativeTitles[j]));
+      }
+    }
+  }
+  item._searchBlob = parts.join(" ");
+  return item._searchBlob;
+};
+
 window.matchesSearchQuery = function(item, rawQuery) {
   if (!rawQuery || !rawQuery.trim()) return true;
   const q = window.normalizeSearchText(rawQuery);
   if (!q) return true;
+  return window.getItemSearchBlob(item).includes(q);
+};
 
-  // 1. Primary title match (case-insensitive & normalized)
-  if (item.title && window.normalizeSearchText(item.title).includes(q)) return true;
-
-  // 2. All alternative titles match
-  const alts = Array.isArray(item.alternativeTitles) ? item.alternativeTitles : [];
-  for (const alt of alts) {
-    if (alt && window.normalizeSearchText(alt).includes(q)) return true;
+window._searchDebounceTimer = null;
+window.scheduleDebouncedSearch = function() {
+  if (window._searchDebounceTimer) {
+    clearTimeout(window._searchDebounceTimer);
   }
-
-  // 3. Category, Type & Genres match
-  if (item.category && window.normalizeSearchText(item.category).includes(q)) return true;
-  if (item.type && window.normalizeSearchText(item.type).includes(q)) return true;
-  const itemGenres = window.getItemGenres(item);
-  for (const g of itemGenres) {
-    if (g && window.normalizeSearchText(g).includes(q)) return true;
-  }
-  if (item.version && window.normalizeSearchText(item.version).includes(q)) return true;
-
-  // 4. Description match
-  if (item.description && window.normalizeSearchText(item.description).includes(q)) return true;
-
-  // 5. Episode titles & episode alternative titles match
-  const episodes = Array.isArray(item.episodes) ? item.episodes : [];
-  for (const ep of episodes) {
-    if (ep && ep.title && window.normalizeSearchText(ep.title).includes(q)) return true;
-    if (ep && Array.isArray(ep.alternativeTitles)) {
-      for (const epAlt of ep.alternativeTitles) {
-        if (epAlt && window.normalizeSearchText(epAlt).includes(q)) return true;
-      }
-    }
-  }
-
-  return false;
+  window._searchDebounceTimer = setTimeout(() => {
+    window._searchDebounceTimer = null;
+    window.performSearch(false);
+  }, 110);
 };
 
 window.setSearchFilter = function(filterVal) {
@@ -11580,7 +11976,7 @@ window.renderSearchPage = function(isRestoring = false) {
     </div>
     <div style="padding:12px;display:flex;flex-direction:column;gap:10px">
       <div style="position:relative;display:flex;align-items:center">
-        <input id="searchInput" class="input" style="padding-left:36px;margin:0" placeholder="ابحث باسم العمل أو أي اسم بديل (عربي، إنجليزي...)" value="${window.escapeDescHtml(savedQuery)}" oninput="window.performSearch(false)" ${shouldAutoFocus ? "autofocus" : ""}>
+        <input id="searchInput" class="input" style="padding-left:36px;margin:0" placeholder="ابحث باسم العمل أو أي اسم بديل (عربي، إنجليزي...)" value="${window.escapeDescHtml(savedQuery)}" oninput="window.scheduleDebouncedSearch()" ${shouldAutoFocus ? "autofocus" : ""}>
         <button type="button" onclick="window.clearSearchInput()" style="position:absolute;left:10px;background:none;border:none;color:#888;font-size:16px;cursor:pointer;padding:4px" title="مسح البحث" aria-label="مسح البحث">✕</button>
       </div>
       <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:4px">
@@ -11715,7 +12111,7 @@ window.performSearch=(preserveSavedOrder = false)=>{
   }
 
   // Deduplication guaranteed: each item from window.allContent is unique in the matches array
-  container.innerHTML = matches.map(createCard).join("");
+  window.renderGridIncrementally(container, matches, createCard, 24);
 };
 window.renderFavorites=()=>{
   main.innerHTML=`<div class="page-header"><button class="back-btn" onclick="goBack()">${t("back_btn")}</button></div><div class="hero" style="height:100px;margin-top:0"><h1 style="font-size:26px">${t("favorites_header")}</h1></div><div class="movies-grid">${window.allContent.filter(x=>favorites.includes(x.id)).map(createCard).join("")}</div>`;
@@ -11780,11 +12176,7 @@ window.renderMoviesSeriesPage = function() {
       </div>
     `;
   } else {
-    contentGridHtml = `
-      <div id="categoryCardsGrid" class="cards-grid-3">
-        ${displayList.map(createCard).join("")}
-      </div>
-    `;
+    contentGridHtml = `<div id="categoryCardsGrid" class="cards-grid-3"></div>`;
   }
 
   main.innerHTML = `
@@ -11811,6 +12203,10 @@ window.renderMoviesSeriesPage = function() {
       ${contentGridHtml}
     </div>
   `;
+  if (displayList.length > 0) {
+    const grid = document.getElementById("categoryCardsGrid");
+    window.renderGridIncrementally(grid, displayList, createCard, 24);
+  }
 };
 
 window.switchMoviesSeriesTab = function(tab) {
@@ -11856,8 +12252,18 @@ window.exitFallbackWatchMode = function() {
 };
 
 window.showPage = (p) => {
+  const now = Date.now();
+  if (p !== "details" && window._lastNavActionKey === ("show_" + p) && (now - window._lastNavActionTs) < 220) {
+    return;
+  }
+  window._lastNavActionKey = "show_" + p;
+  window._lastNavActionTs = now;
+
   if (currentPage === "watch" && p !== "watch") {
     window.exitFallbackWatchMode();
+  }
+  if (typeof window.cleanupBeforeNavigation === "function") {
+    window.cleanupBeforeNavigation();
   }
   if (p !== "details" && p !== "episodes" && p !== "news") {
     document.body.classList.remove("page-details-active", "page-episodes-active", "page-news-active");
@@ -11921,6 +12327,9 @@ window.renderCurrentPage = () => {
 };
 
 window.goBack = () => {
+  if (typeof window.cleanupBeforeNavigation === "function") {
+    window.cleanupBeforeNavigation();
+  }
   // Clean up fallback HTML5 video interval and restore portrait orientation if leaving "watch"
   if (currentPage === "watch") {
     window.exitFallbackWatchMode();
@@ -12095,6 +12504,15 @@ window.renderAddPage=(isBack=false)=>{
     historyStack=[];
     showPage('home');
     return;
+  }
+  if (typeof window.ensureProfileAvatarsSynced === "function") {
+    window.ensureProfileAvatarsSynced();
+  }
+  if (typeof window.setupAdminNotificationListeners === "function") {
+    window.setupAdminNotificationListeners();
+  }
+  if (typeof window.setupReportsListener === "function") {
+    window.setupReportsListener();
   }
   if(!isBack&&currentPage!=="add"){window.saveCurrentPageScroll();historyStack.push(currentPage);}
   document.body.classList.remove("page-details-active", "page-episodes-active", "page-news-active");
@@ -12762,43 +13180,54 @@ window.submitUserReport = async function() {
   }
 };
 
-// Real-time listener on `app_reports` for Admin dashboard & badge updates
-const reportsQuery = query(reportsColRef, orderBy("createdAtMs", "desc"), limit(300));
-onSnapshot(reportsQuery, (snap) => {
-  window.allReportsList = snap.docs.map(d => ({
-    firebaseReportId: d.id,
-    ...d.data()
-  }));
+// Role-gated real-time listener on `app_reports` (Admin & Assistant only)
+window._reportsUnsubscribe = null;
+window.setupReportsListener = function() {
+  if (window.currentUserRole !== "ADMIN" && window.currentUserRole !== "ASSISTANT") return;
+  if (window._reportsUnsubscribe) return;
+  const reportsQuery = query(reportsColRef, orderBy("createdAtMs", "desc"), limit(300));
+  window._reportsUnsubscribe = onSnapshot(reportsQuery, (snap) => {
+    window.allReportsList = snap.docs.map(d => ({
+      firebaseReportId: d.id,
+      ...d.data()
+    }));
 
-  // Update badge on navbar and admin panel if Admin
-  const newCount = window.allReportsList.filter(r => (r.status || "جديد") === "جديد").length;
-  const navBadge = document.getElementById("navReportsBadge");
-  if (navBadge) {
-    if (window.currentUserRole === "ADMIN" && newCount > 0) {
-      navBadge.style.display = "inline-block";
-      navBadge.innerText = newCount > 99 ? "99+" : String(newCount);
-    } else {
-      navBadge.style.display = "none";
-    }
-  }
-
-  // Automatically refresh Admin Reports page or Report Detail page if currently open
-  if (window.currentUserRole === "ADMIN") {
-    if (currentPage === "reports") {
-      if (!window.isTypingOrInputActive || !window.isTypingOrInputActive()) {
-        window.renderAdminReportsListDomOnly();
-      }
-    } else if (currentPage === "report_detail" && window.currentViewingReportId) {
-      if (!window.isTypingOrInputActive || !window.isTypingOrInputActive()) {
-        window.renderReportDetailPage(window.currentViewingReportId);
+    const newCount = window.allReportsList.filter(r => (r.status || "جديد") === "جديد").length;
+    const navBadge = document.getElementById("navReportsBadge");
+    if (navBadge) {
+      if ((window.currentUserRole === "ADMIN" || window.currentUserRole === "ASSISTANT") && newCount > 0) {
+        navBadge.style.display = "inline-block";
+        navBadge.innerText = newCount > 99 ? "99+" : String(newCount);
+      } else {
+        navBadge.style.display = "none";
       }
     }
-  }
-}, (err) => {
-  console.warn("app_reports realtime listener error:", err);
-});
 
-// ================= Profile Avatars Management & Firestore Sync =================
+    if (window.currentUserRole === "ADMIN" || window.currentUserRole === "ASSISTANT") {
+      if (currentPage === "reports") {
+        if (!window.isTypingOrInputActive || !window.isTypingOrInputActive()) {
+          window.renderAdminReportsListDomOnly();
+        }
+      } else if (currentPage === "report_detail" && window.currentViewingReportId) {
+        if (!window.isTypingOrInputActive || !window.isTypingOrInputActive()) {
+          window.renderReportDetailPage(window.currentViewingReportId);
+        }
+      }
+    }
+  }, (err) => {
+    console.warn("app_reports realtime listener error:", err);
+  });
+};
+
+window.teardownReportsListener = function() {
+  if (window._reportsUnsubscribe) {
+    try { window._reportsUnsubscribe(); } catch (_) {}
+    window._reportsUnsubscribe = null;
+  }
+  window.allReportsList = [];
+};
+
+// ================= Profile Avatars Management & On-Demand Firestore Sync =================
 const avatarsColRef = collection(db, "profile_avatars");
 
 const PRESET_AVATARS = [
@@ -12819,50 +13248,57 @@ try {
 window.appProfileAvatars = (Array.isArray(cachedAvatars) && cachedAvatars.length > 0) ? cachedAvatars : [...PRESET_AVATARS];
 window.selectedAvatarForUser = "";
 window._pendingAdminAvatarUrl = "";
+window._avatarsUnsubscribe = null;
 
-// Real-time listener for profile avatars from Firestore
-try {
-  onSnapshot(avatarsColRef, (snap) => {
-    const firestoreAvatars = snap.docs.map(d => ({
-      id: d.id,
-      url: d.data().url,
-      createdAt: d.data().createdAt || 0,
-      createdBy: d.data().createdBy || ""
-    })).filter(a => !!a.url);
+window.ensureProfileAvatarsSynced = function() {
+  if (window._avatarsUnsubscribe) return;
+  try {
+    window._avatarsUnsubscribe = onSnapshot(avatarsColRef, (snap) => {
+      const firestoreAvatars = snap.docs.map(d => ({
+        id: d.id,
+        url: d.data().url,
+        createdAt: d.data().createdAt || 0,
+        createdBy: d.data().createdBy || ""
+      })).filter(a => !!a.url);
 
-    // Merge firestoreAvatars (admin custom additions at top) with presets
-    const combined = [...firestoreAvatars];
-    PRESET_AVATARS.forEach(p => {
-      if (!combined.some(c => c.url === p.url)) {
-        combined.push(p);
+      const combined = [...firestoreAvatars];
+      PRESET_AVATARS.forEach(p => {
+        if (!combined.some(c => c.url === p.url)) {
+          combined.push(p);
+        }
+      });
+
+      window.appProfileAvatars = combined;
+      try {
+        localStorage.setItem("blackanime_profile_avatars", JSON.stringify(combined));
+      } catch(e) {}
+
+      const adminGrid = document.getElementById("adminAvatarsGridContainer");
+      if (adminGrid && typeof window.renderAdminAvatarsGridHtml === "function") {
+        adminGrid.innerHTML = window.renderAdminAvatarsGridHtml();
       }
+      const countBadge = document.getElementById("adminAvatarsCountBadge");
+      if (countBadge) {
+        countBadge.textContent = `${window.appProfileAvatars.length} صورة متاحة`;
+      }
+
+      if (currentPage === "avatar_picker" && typeof window.renderAvatarPickerPage === "function") {
+        window.renderAvatarPickerPage();
+      }
+    }, (err) => {
+      console.warn("profile_avatars realtime listener error:", err);
     });
+  } catch(e) {
+    console.warn("Failed to attach profile_avatars listener:", e);
+  }
+};
 
-    window.appProfileAvatars = combined;
-    try {
-      localStorage.setItem("blackanime_profile_avatars", JSON.stringify(combined));
-    } catch(e) {}
-
-    // Refresh UI if Admin is currently viewing the Add page
-    const adminGrid = document.getElementById("adminAvatarsGridContainer");
-    if (adminGrid && typeof window.renderAdminAvatarsGridHtml === "function") {
-      adminGrid.innerHTML = window.renderAdminAvatarsGridHtml();
-    }
-    const countBadge = document.getElementById("adminAvatarsCountBadge");
-    if (countBadge) {
-      countBadge.textContent = `${window.appProfileAvatars.length} صورة متاحة`;
-    }
-
-    // Refresh avatar picker page if currently active
-    if (currentPage === "avatar_picker" && typeof window.renderAvatarPickerPage === "function") {
-      window.renderAvatarPickerPage();
-    }
-  }, (err) => {
-    console.warn("profile_avatars realtime listener error:", err);
-  });
-} catch(e) {
-  console.warn("Failed to attach profile_avatars listener:", e);
-}
+window.teardownProfileAvatarsListener = function() {
+  if (window._avatarsUnsubscribe) {
+    try { window._avatarsUnsubscribe(); } catch (_) {}
+    window._avatarsUnsubscribe = null;
+  }
+};
 
 // 1. Admin Section in Add Page: «إدارة صور البروفايل»
 window.renderAdminAvatarManagementSectionHtml = function() {
@@ -13123,6 +13559,9 @@ window.confirmDeleteAdminAvatar = async function(avatarId, avatarUrl) {
 
 // 2. User Avatar Picker Page: «اختيار صورة البروفايل للمستخدم»
 window.openAvatarPickerPage = function() {
+  if (typeof window.ensureProfileAvatarsSynced === "function") {
+    window.ensureProfileAvatarsSynced();
+  }
   window.selectedAvatarForUser = window.currentAuthUser?.photoURL || "";
   navigateTo("avatar_picker", window.renderAvatarPickerPage);
 };
@@ -13280,6 +13719,9 @@ window.openAdminReportsPage = function(isFromShowPage = false) {
     alert("⛔ عذراً، الوصول إلى إدارة البلاغات مخصص للمشرف فقط.");
     showPage("home");
     return;
+  }
+  if (typeof window.setupReportsListener === "function") {
+    window.setupReportsListener();
   }
   if (!isFromShowPage && currentPage !== "reports") {
     window.saveCurrentPageScroll();
@@ -14093,6 +14535,8 @@ window.saveEditedEpisode = async function() {
     }
     await updateDoc(doc(db, "movies", fid), updatePayload);
     item.episodes = episodes;
+    delete item._searchBlob;
+    window._contentRevision = (window._contentRevision || 0) + 1;
     if (idx === 0) {
       item.video = video;
       item.altUrl = altUrl;
@@ -14116,11 +14560,12 @@ window.saveEditedEpisode = async function() {
   }
 };
 
-/* ================= AdMob 5-Ads Reward & Episode Ad Logic ================= */
+/* ================= AdMob 5-Ads Reward, Episode Watch Ad & Download Ad Logic ================= */
 const ADMOB_CONFIG = {
   appId: "ca-app-pub-2277779478101583~2644517153",
   rewardedAdUnitId: "ca-app-pub-2277779478101583/1404104591",
   episodeRewardedAdUnitId: "ca-app-pub-2277779478101583/9116970862",
+  downloadRewardedAdUnitId: "ca-app-pub-2277779478101583/9003880054",
   initializeForTesting: false,
   searchTimeoutMs: 30000
 };
@@ -14152,6 +14597,14 @@ let currentEpisodeAdResolved = false;
 window.pendingEpisodeToWatch = null;
 let isOpeningEpisodeInProgress = false;
 
+// ================= SEPARATE STATE: DOWNLOAD REWARDED AD SYSTEM =================
+let downloadAdState = AD_STATE.IDLE;
+let currentDownloadAttemptId = "";
+let downloadSearchTimeoutId = null;
+let currentDownloadAdResolved = false;
+window.pendingDownloadTarget = null;
+window._downloadAdRewardVerified = false;
+
 // Unified state query helper
 window.getAdState = function() {
   if (window.AndroidBridge && typeof window.AndroidBridge.getAdState === "function") {
@@ -14159,8 +14612,8 @@ window.getAdState = function() {
       return window.AndroidBridge.getAdState();
     } catch (_) {}
   }
-  if (fiveAdsState === AD_STATE.SHOWING || episodeAdState === AD_STATE.SHOWING) return "SHOWING";
-  if (fiveAdsState === AD_STATE.LOADING || episodeAdState === AD_STATE.LOADING) return "LOADING";
+  if (fiveAdsState === AD_STATE.SHOWING || episodeAdState === AD_STATE.SHOWING || downloadAdState === AD_STATE.SHOWING) return "SHOWING";
+  if (fiveAdsState === AD_STATE.LOADING || episodeAdState === AD_STATE.LOADING || downloadAdState === AD_STATE.LOADING) return "LOADING";
   return "IDLE";
 };
 
@@ -14847,9 +15300,275 @@ window.onEpisodeResult = function(success, detail, attemptId, fid, idx) {
   }
 };
 
+// ================= Download Rewarded Ad Confirmation & Flow (Unit 9003880054) =================
+window.showDownloadAdConfirmPopup = function(fid, idx, videoUrl, animeTitle, epTitle, episodeKey) {
+  window.pendingDownloadTarget = { fid, idx, videoUrl, animeTitle, epTitle, episodeKey };
+  window._downloadAdRewardVerified = false;
+  downloadAdState = AD_STATE.IDLE;
+  currentDownloadAdResolved = false;
+
+  const popup = document.getElementById("downloadAdConfirmPopup");
+  if (!popup) return;
+
+  const titleEl = document.getElementById("downloadAdPopupTitle");
+  const descEl = document.getElementById("downloadAdPopupDesc");
+  const iconEl = document.getElementById("downloadAdPopupIcon");
+  const statusEl = document.getElementById("downloadAdStatusMsg");
+  const okBtn = document.getElementById("downloadAdOkBtn");
+  const cancelBtn = document.getElementById("downloadAdCancelBtn");
+
+  if (titleEl) titleEl.innerText = "تحميل الحلقة";
+  if (descEl) descEl.innerText = "لمتابعة تحميل الحلقة، يجب مشاهدة إعلان قصير.";
+  if (iconEl) iconEl.innerText = "⬇️";
+  if (statusEl) {
+    statusEl.style.display = "none";
+    statusEl.innerHTML = "";
+  }
+  if (okBtn) {
+    okBtn.style.display = "block";
+    okBtn.disabled = false;
+    okBtn.innerText = "موافق";
+  }
+  if (cancelBtn) {
+    cancelBtn.style.display = "block";
+    cancelBtn.disabled = false;
+    cancelBtn.innerText = "إلغاء";
+  }
+  popup.style.display = "flex";
+};
+
+window.cancelDownloadAdWatch = function() {
+  if (currentDownloadAttemptId && window.AndroidBridge && typeof window.AndroidBridge.cancelDownloadAdAttempt === "function") {
+    try { window.AndroidBridge.cancelDownloadAdAttempt(currentDownloadAttemptId); } catch (_) {}
+  } else if (currentDownloadAttemptId && window.AndroidBridge && typeof window.AndroidBridge.cancelAdAttempt === "function") {
+    try { window.AndroidBridge.cancelAdAttempt(currentDownloadAttemptId); } catch (_) {}
+  }
+  if (downloadSearchTimeoutId) {
+    clearTimeout(downloadSearchTimeoutId);
+    downloadSearchTimeoutId = null;
+  }
+  currentDownloadAttemptId = "";
+  downloadAdState = AD_STATE.IDLE;
+  currentDownloadAdResolved = false;
+  window._downloadAdRewardVerified = false;
+  window.pendingDownloadTarget = null;
+
+  const popup = document.getElementById("downloadAdConfirmPopup");
+  if (popup) popup.style.display = "none";
+};
+
+window.confirmDownloadAdWatch = function() {
+  if (!window.pendingDownloadTarget) return;
+
+  if (downloadAdState === AD_STATE.SHOWING || downloadAdState === AD_STATE.LOADING) {
+    console.warn("DownloadAd: Another download ad attempt is already active.");
+    return;
+  }
+
+  currentDownloadAttemptId = "dl_" + Date.now() + "_" + Math.floor(Math.random() * 1000000);
+  const thisAttemptId = currentDownloadAttemptId;
+  downloadAdState = AD_STATE.LOADING;
+  currentDownloadAdResolved = false;
+  window._downloadAdRewardVerified = false;
+
+  const target = window.pendingDownloadTarget;
+  const fid = target.fid || "";
+  const idx = target.idx !== undefined ? target.idx : 0;
+  const episodeKey = target.episodeKey || `${fid}_${idx}`;
+
+  const titleEl = document.getElementById("downloadAdPopupTitle");
+  const descEl = document.getElementById("downloadAdPopupDesc");
+  const iconEl = document.getElementById("downloadAdPopupIcon");
+  const statusEl = document.getElementById("downloadAdStatusMsg");
+  const okBtn = document.getElementById("downloadAdOkBtn");
+  const cancelBtn = document.getElementById("downloadAdCancelBtn");
+
+  if (titleEl) titleEl.innerText = "تحميل الحلقة";
+  if (descEl) descEl.innerText = "جاري تحميل الإعلان...";
+  if (iconEl) iconEl.innerHTML = '<div class="ad-loader-spinner" style="margin:0 auto 10px"></div>';
+  if (statusEl) {
+    statusEl.style.display = "none";
+    statusEl.innerHTML = "";
+  }
+  if (okBtn) okBtn.style.display = "none";
+  if (cancelBtn) {
+    cancelBtn.style.display = "block";
+    cancelBtn.innerText = "إلغاء";
+  }
+
+  if (downloadSearchTimeoutId) {
+    clearTimeout(downloadSearchTimeoutId);
+    downloadSearchTimeoutId = null;
+  }
+
+  downloadSearchTimeoutId = setTimeout(() => {
+    if (currentDownloadAttemptId !== thisAttemptId) return;
+    if (downloadAdState === AD_STATE.SHOWING) return;
+    if (!currentDownloadAdResolved) {
+      console.warn("DownloadAd: Timed out waiting for download rewarded ad: " + thisAttemptId);
+      handleDownloadAdFailure(thisAttemptId, "timeout");
+    }
+  }, ADMOB_CONFIG.searchTimeoutMs);
+
+  if (window.AndroidBridge && typeof window.AndroidBridge.loadAndShowDownloadAd === "function") {
+    try {
+      window.AndroidBridge.loadAndShowDownloadAd(ADMOB_CONFIG.searchTimeoutMs, thisAttemptId, fid, idx, episodeKey);
+    } catch (e) {
+      console.warn("AndroidBridge loadAndShowDownloadAd error:", e);
+      handleDownloadAdFailure(thisAttemptId, "bridge_error");
+    }
+  } else if (window.AndroidBridge && typeof window.AndroidBridge.loadAndShowRewardedAd === "function") {
+    try {
+      window.AndroidBridge.loadAndShowRewardedAd(ADMOB_CONFIG.downloadRewardedAdUnitId, ADMOB_CONFIG.searchTimeoutMs, thisAttemptId);
+    } catch (e) {
+      console.warn("AndroidBridge loadAndShowRewardedAd error:", e);
+      handleDownloadAdFailure(thisAttemptId, "bridge_error");
+    }
+  } else {
+    handleDownloadAdFailure(thisAttemptId, "bridge_unavailable");
+  }
+};
+
+function handleDownloadAdFailure(attemptId, reason) {
+  if (attemptId && currentDownloadAttemptId && attemptId !== currentDownloadAttemptId) return;
+  if (downloadAdState === AD_STATE.SHOWING) return;
+  if (currentDownloadAdResolved) return;
+  currentDownloadAdResolved = true;
+
+  if (downloadSearchTimeoutId) {
+    clearTimeout(downloadSearchTimeoutId);
+    downloadSearchTimeoutId = null;
+  }
+
+  // STRICT REQUIREMENT: NEVER start download on failure, no_fill, timeout, or early dismiss
+  downloadAdState = AD_STATE.FAILED;
+  window._downloadAdRewardVerified = false;
+  currentDownloadAttemptId = "";
+
+  const iconEl = document.getElementById("downloadAdPopupIcon");
+  const descEl = document.getElementById("downloadAdPopupDesc");
+  const statusEl = document.getElementById("downloadAdStatusMsg");
+  const okBtn = document.getElementById("downloadAdOkBtn");
+  const cancelBtn = document.getElementById("downloadAdCancelBtn");
+
+  if (iconEl) iconEl.innerText = "⚠️";
+  if (descEl) descEl.innerText = "لم يتم بدء التحميل لأنه لم تتوفر أو تكتمل مشاهدة الإعلان.";
+  if (statusEl) {
+    statusEl.style.display = "block";
+    statusEl.style.background = "#260e0e";
+    statusEl.style.borderColor = "#5c1b1b";
+    statusEl.style.color = "#f87171";
+    statusEl.innerText = reason === "timeout"
+      ? "انتهت مهلة تحميل الإعلان. يرجى المحاولة مرة أخرى لبدء التحميل."
+      : "تعذر تحميل الإعلان حالياً. يرجى الضغط على إعادة المحاولة لمشاهدة الإعلان ومتابعة التحميل.";
+  }
+  if (okBtn) {
+    okBtn.style.display = "block";
+    okBtn.disabled = false;
+    okBtn.innerText = "إعادة المحاولة";
+  }
+  if (cancelBtn) {
+    cancelBtn.style.display = "block";
+    cancelBtn.disabled = false;
+    cancelBtn.innerText = "إلغاء";
+  }
+}
+
+window.onDownloadAdShowed = function(attemptId) {
+  if (attemptId && currentDownloadAttemptId && attemptId !== currentDownloadAttemptId) return;
+  downloadAdState = AD_STATE.SHOWING;
+  if (downloadSearchTimeoutId) {
+    clearTimeout(downloadSearchTimeoutId);
+    downloadSearchTimeoutId = null;
+  }
+  const descEl = document.getElementById("downloadAdPopupDesc");
+  const statusEl = document.getElementById("downloadAdStatusMsg");
+  if (descEl) descEl.innerText = "يتم الآن عرض الإعلان...";
+  if (statusEl) {
+    statusEl.style.display = "block";
+    statusEl.style.background = "#0f172a";
+    statusEl.style.borderColor = "#1e293b";
+    statusEl.style.color = "#38bdf8";
+    statusEl.innerText = "يرجى مشاهدة الإعلان حتى النهاية لبدء تحميل الحلقة.";
+  }
+};
+
+window.onDownloadAdRewardEarned = function(attemptId, episodeKey) {
+  if (attemptId && currentDownloadAttemptId && attemptId !== currentDownloadAttemptId) return;
+  window._downloadAdRewardVerified = true;
+  console.log("DownloadAd: onDownloadAdRewardEarned verified for attempt: " + attemptId + ", key=" + episodeKey);
+};
+
+window.onDownloadAdResult = function(success, detail, attemptId, episodeKey) {
+  console.log("DownloadAd: onDownloadAdResult: success=" + success + ", detail=" + detail + ", attemptId=" + attemptId + ", key=" + episodeKey);
+  if (attemptId && currentDownloadAttemptId && attemptId !== currentDownloadAttemptId) return;
+  if (currentDownloadAdResolved) return;
+  currentDownloadAdResolved = true;
+
+  if (downloadSearchTimeoutId) {
+    clearTimeout(downloadSearchTimeoutId);
+    downloadSearchTimeoutId = null;
+  }
+
+  // STRICT REQUIREMENT: Download begins ONLY after full ad reward is earned
+  if (success === true && detail === "watched" && window._downloadAdRewardVerified === true) {
+    const confirmedAttemptId = currentDownloadAttemptId || attemptId || "";
+    const target = window.pendingDownloadTarget;
+    window.pendingDownloadTarget = null;
+    currentDownloadAttemptId = "";
+    downloadAdState = AD_STATE.IDLE;
+
+    const popup = document.getElementById("downloadAdConfirmPopup");
+    if (popup) popup.style.display = "none";
+
+    if (target) {
+      window.proceedWithConfirmedDownload(target, confirmedAttemptId);
+    }
+    window._downloadAdRewardVerified = false;
+    return;
+  }
+
+  window._downloadAdRewardVerified = false;
+  currentDownloadAttemptId = "";
+
+  if (detail === "dismissed_early" || detail === "reward_not_earned") {
+    downloadAdState = AD_STATE.DISMISSED;
+    const iconEl = document.getElementById("downloadAdPopupIcon");
+    const descEl = document.getElementById("downloadAdPopupDesc");
+    const statusEl = document.getElementById("downloadAdStatusMsg");
+    const okBtn = document.getElementById("downloadAdOkBtn");
+    const cancelBtn = document.getElementById("downloadAdCancelBtn");
+
+    if (iconEl) iconEl.innerText = "⏳";
+    if (descEl) descEl.innerText = "لم تكتمل مشاهدة الإعلان.";
+    if (statusEl) {
+      statusEl.style.display = "block";
+      statusEl.style.background = "#260e0e";
+      statusEl.style.borderColor = "#5c1b1b";
+      statusEl.style.color = "#f87171";
+      statusEl.innerText = "لن يبدأ التحميل لأنك أغلقت الإعلان قبل اكتماله. اضغط إعادة المحاولة ومشاهدته للنهاية.";
+    }
+    if (okBtn) {
+      okBtn.style.display = "block";
+      okBtn.disabled = false;
+      okBtn.innerText = "إعادة المحاولة";
+    }
+    if (cancelBtn) {
+      cancelBtn.style.display = "block";
+      cancelBtn.disabled = false;
+      cancelBtn.innerText = "إلغاء";
+    }
+  } else {
+    downloadAdState = AD_STATE.IDLE;
+    handleDownloadAdFailure(attemptId, detail);
+  }
+};
+
 // ================= Backward Compatibility Dispatchers =================
 window.onAdMobAdShowed = function(attemptId) {
-  if (attemptId && attemptId.startsWith("ep_")) {
+  if (attemptId && attemptId.startsWith("dl_")) {
+    window.onDownloadAdShowed(attemptId);
+  } else if (attemptId && attemptId.startsWith("ep_")) {
     window.onEpisodeAdShowed(attemptId);
   } else {
     window.onFiveAdsShowed(attemptId);
@@ -14857,7 +15576,9 @@ window.onAdMobAdShowed = function(attemptId) {
 };
 
 window.onAdMobRewardResult = function(success, detail, attemptId) {
-  if (attemptId && attemptId.startsWith("ep_")) {
+  if (attemptId && attemptId.startsWith("dl_")) {
+    window.onDownloadAdResult(success, detail, attemptId, "");
+  } else if (attemptId && attemptId.startsWith("ep_")) {
     window.onEpisodeResult(success, detail, attemptId, "", 0);
   } else {
     window.onFiveAdsResult(success, detail, attemptId, undefined, false);
@@ -14977,6 +15698,9 @@ window.rebuildSortedNewsArray = function() {
   } catch (e) {}
 })();
 
+window._newsRevision = window._newsRevision || 0;
+window._lastNewsSignature = window._lastNewsSignature || "";
+
 window.setupNewsListener = function() {
   if (window.newsUnsubscribe) {
     try { window.newsUnsubscribe(); } catch (e) {}
@@ -14988,14 +15712,22 @@ window.setupNewsListener = function() {
   const onNewsSnapshot = (snap) => {
     window._newsLoadError = "";
     const freshMap = new Map();
+    const sigParts = [];
     snap.docs.forEach(docSnap => {
       const item = window.parseNewsDoc(docSnap);
       if (item && item.id && item.title) {
         freshMap.set(item.id, item);
+        sigParts.push(`${item.id}:${item.createdAtMs}`);
       }
     });
+    const nextSig = sigParts.join("|");
+    if (window._isInitialNewsLoaded && nextSig === window._lastNewsSignature) {
+      return;
+    }
+    window._lastNewsSignature = nextSig;
     window._newsMap = freshMap;
     window._isInitialNewsLoaded = true;
+    window._newsRevision++;
     window.rebuildSortedNewsArray();
 
     if (currentPage === "news") {
@@ -16116,6 +16848,8 @@ window.saveAlternativeTitlesFromModal = async function() {
 
     item.title = newTitle;
     item.alternativeTitles = cleanList;
+    delete item._searchBlob;
+    window._contentRevision = (window._contentRevision || 0) + 1;
 
     if (statusMsg) statusMsg.innerHTML = '<span style="color:#4ade80">✅ تم حفظ الأسماء البديلة بنجاح!</span>';
 
@@ -16385,6 +17119,8 @@ window.saveContentFromModal = async function() {
     item.banner = newBanner;
     item.trailerUrl = newTrailer;
     item.status = newStatus;
+    delete item._searchBlob;
+    window._contentRevision = (window._contentRevision || 0) + 1;
 
     if (statusMsg) statusMsg.innerHTML = '<span style="color:#4ade80">✅ تم حفظ جميع التعديلات والتصنيفات بنجاح!</span>';
     setTimeout(() => {
