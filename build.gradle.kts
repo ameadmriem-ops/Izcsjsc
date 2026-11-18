@@ -11,3 +11,22 @@ tasks.register<Copy>("exportApkToHhh") {
   from(layout.projectDirectory.file("app/build/outputs/apk/debug/app-debug.apk"))
   into(layout.projectDirectory.dir("hhh"))
 }
+
+tasks.register<Zip>("exportProjectZip") {
+  archiveFileName.set("MY_CINEMA_updated.zip")
+  destinationDirectory.set(layout.projectDirectory)
+  from(layout.projectDirectory) {
+    exclude(
+      ".gradle/**",
+      ".kotlin/**",
+      ".build-outputs/**",
+      "build/**",
+      "app/build/**",
+      "hhh/**",
+      "public/**",
+      "*.zip",
+      "debug.keystore",
+      "debug.keystore.base64"
+    )
+  }
+}
